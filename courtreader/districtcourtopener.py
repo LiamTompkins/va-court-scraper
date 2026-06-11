@@ -5,6 +5,7 @@ import six.moves.urllib.request, six.moves.urllib.parse, six.moves.urllib.error
 from bs4 import BeautifulSoup
 from .opener import Opener
 from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
 from six.moves import input
 
 
@@ -37,13 +38,28 @@ class DistrictCourtOpener:
         return None
 
     def open_driver(self):
-        self.driver = webdriver.Chrome('./chromedriver')
+        self.driver = webdriver.Chrome(service=Service('./chromedriver.exe'))
         self.driver.implicitly_wait(3)
         self.driver_open = True
 
     def open_welcome_page(self):
         url = self.url('caseSearch.do?welcomePage=welcomePage')
-        page_content = self.make_request('https://google.com')
+        # Use Selenium to get a valid session cookie, since the site requires
+        # JavaScript to initialize the session before Mechanize can take over.
+        self.open_driver()
+        self.driver.get(url)
+        time.sleep(3)
+        selenium_cookies = self.driver.get_cookies()
+        self.driver.quit()
+
+        # Visit the URL first so Mechanize has a document context for cookies
+        try:
+            self.make_request(url)
+        except Exception:
+            pass
+        for cookie in selenium_cookies:
+            self.opener.set_cookie(cookie['name'], cookie['value'])
+
         page_content = self.make_request(url)
         # See if we need to solve a captcha
         if b'By clicking Accept' in page_content:
