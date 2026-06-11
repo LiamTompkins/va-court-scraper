@@ -4,8 +4,7 @@ import time
 import six.moves.urllib.request, six.moves.urllib.parse, six.moves.urllib.error
 from bs4 import BeautifulSoup
 from .opener import Opener
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
+import requests
 from six.moves import input
 
 
@@ -38,30 +37,26 @@ class DistrictCourtOpener:
         return None
 
     def open_driver(self):
-        self.driver = webdriver.Chrome(service=Service('./chromedriver.exe'))
-        self.driver.implicitly_wait(3)
-        self.driver_open = True
+        pass
 
     def open_welcome_page(self):
         url = self.url('caseSearch.do?welcomePage=welcomePage')
-        # Use Selenium to get a valid session cookie, since the site requires
-        # JavaScript to initialize the session before Mechanize can take over.
-        self.open_driver()
-        self.driver.get(url)
-        time.sleep(3)
-        selenium_cookies = self.driver.get_cookies()
-        self.driver.quit()
+        # Use requests to get a server-side session cookie without needing a browser.
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+        })
+        session.get(url)
 
-        # Visit the URL first so Mechanize has a document context for cookies
+        # Pass cookies obtained from requests into Mechanize
         try:
             self.make_request(url)
         except Exception:
             pass
-        for cookie in selenium_cookies:
-            self.opener.set_cookie(cookie['name'], cookie['value'])
+        for name, value in session.cookies.items():
+            self.opener.set_cookie(name, value)
 
         page_content = self.make_request(url)
-        # See if we need to solve a captcha
         if b'By clicking Accept' in page_content:
             self.solve_captcha(url)
             page_content = self.make_request(url)
