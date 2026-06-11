@@ -27,7 +27,7 @@ I'll be using AWS, but that's not a requirement.
 
 1. Install dependencies
 
-        pip install selenium mechanize beautifulsoup4 psycopg2 SQLAlchemy GeoAlchemy2 pgcli
+        pip install selenium mechanize beautifulsoup4 psycopg2 SQLAlchemy GeoAlchemy2 pgcli requests
 
 1. Connect to the database and add the postgis extension
 
@@ -41,7 +41,7 @@ I'll be using AWS, but that's not a requirement.
 
 ### Initalize database with list of courts
 
-Running this script will open a chrome window for the district court website. Click the Accept button and solve the captcha. The script will continue automatically once you do. 
+Running this script will populate the database with the list of courts from the state website.
 
         python load_courts_to_db.py
 
@@ -125,7 +125,7 @@ git clone https://github.com/bschoenfeld/va-court-scraper.git
 cd va-court-scraper
 virtualenv venv
 source venv/bin/activate
-pip install selenium mechanize beautifulsoup4 psycopg2 SQLAlchemy GeoAlchemy2 pgcli boto3 awscli python-firebase
+pip install selenium mechanize beautifulsoup4 psycopg2 SQLAlchemy GeoAlchemy2 pgcli boto3 awscli python-firebase requests
 export FIREBASE_TOKEN='<FIREBASETOKEN>'
 export PGHOST='<PGHOST>'
 export PGDATABASE='<PGDATABASE>'
