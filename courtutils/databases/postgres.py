@@ -46,11 +46,12 @@ class ActiveDateTask():
     startdate = Column(Date)
     enddate = Column(Date)
     casetype = Column(String)
+    last_alive = Column(DateTime, default=datetime)
 
-class CircuitCourtActiveDateTask(Base, DateTask):
+class CircuitCourtActiveDateTask(Base, ActiveDateTask):
     __tablename__ = 'circuit_court_active_date_tasks'
 
-class DistrictCourtActiveDateTask(Base, DateTask):
+class DistrictCourtActiveDateTask(Base, ActiveDateTask):
     __tablename__ = 'district_court_active_date_tasks'
 
 
@@ -687,6 +688,15 @@ class PostgresDatabase():
         for table in TABLES:
             table.__table__.create(self.engine, checkfirst=True) #pylint: disable=E1101
 
+        # Add last_alive column to active task tables if it doesn't exist yet
+        from sqlalchemy import text
+        with self.engine.connect() as conn:
+            for table_name in ['circuit_court_active_date_tasks', 'district_court_active_date_tasks']:
+                conn.execute(
+                    text("ALTER TABLE %s ADD COLUMN IF NOT EXISTS last_alive TIMESTAMP" % table_name)
+                )
+            conn.commit()
+
         self.court_type = court_type
         if court_type == 'circuit':
             self.court_builder = CircuitCourt
@@ -785,7 +795,8 @@ class PostgresDatabase():
                         fips=task.fips,
                         startdate=task.startdate,
                         enddate=task.enddate,
-                        casetype=task.casetype
+                        casetype=task.casetype,
+                        last_alive=datetime.now()
                     )
                 )
                 self.session.commit()
@@ -799,6 +810,38 @@ class PostgresDatabase():
             except IntegrityError:
                 print('WARNING - FAILED TO GET NEW TASK')
                 self.session.rollback()
+
+    def update_task_heartbeat(self, task):
+        self.session \
+            .query(self.active_date_task_builder) \
+            .filter(
+                self.active_date_task_builder.fips == int(task['fips']),
+                self.active_date_task_builder.casetype == task['case_type']
+            ) \
+            .update({'last_alive': datetime.now()})
+        self.session.commit()
+
+    def reset_stale_tasks(self, stale_threshold_seconds=120):
+        from datetime import timedelta
+        cutoff = datetime.now() - timedelta(seconds=stale_threshold_seconds)
+        stale_tasks = self.session \
+            .query(self.active_date_task_builder) \
+            .filter(self.active_date_task_builder.last_alive < cutoff) \
+            .all()
+        for task in stale_tasks:
+            print('Resetting stale task: fips=%s casetype=%s last_alive=%s' % (
+                task.fips, task.casetype, task.last_alive))
+            self.session.add(
+                self.date_task_builder(
+                    fips=task.fips,
+                    startdate=task.startdate,
+                    enddate=task.enddate,
+                    casetype=task.casetype
+                )
+            )
+            self.session.delete(task)
+        self.session.commit()
+        return len(stale_tasks)
 
     def add_date_search(self, search):
         self.session.add(

@@ -57,7 +57,15 @@ Now you can create collectors. When a collector runs, it will take a task and st
 
         python court_bulk_collector.py district
 
-_Warning - This task system that I've created is pretty terrible and uncompleted tasks can easily be lost. I'd love to replace it with a more robust tool, but I haven't gotten around to it yet. Sorry_
+### Run the task watchdog
+
+The task watchdog prevents tasks from being permanently lost if a collector crashes mid-run. It monitors active tasks and automatically resets any that have not sent a heartbeat in over 2 minutes back to pending, so another worker can pick them up.
+
+Run it in a separate terminal alongside your collectors:
+
+        python task_watchdog.py
+
+Only one instance of the watchdog needs to run regardless of how many collectors you have. It is recommended to always run the watchdog when running collectors.
 
 ## How to generate person ids
 
