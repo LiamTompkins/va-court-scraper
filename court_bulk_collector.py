@@ -7,6 +7,7 @@ import sys
 import time
 import traceback
 import socket
+import threading
 
 # Prevent infinite hangs on network sockets (which blocks Ctrl-C in Windows)
 socket.setdefaulttimeout(60)
@@ -88,6 +89,22 @@ def get_cases_on_date(db, reader, fips, case_type, date, dateStr):
             print('[%s] [%d/%d] %s %s' % (fips, i, total_cases, case['case_number'], case['defendant']))
             db.replace_case_details(case, case_type)
 
+def start_heartbeat(task, interval=30):
+    stop_event = threading.Event()
+    def heartbeat():
+        # Use a separate DB connection so the heartbeat doesn't interfere
+        # with the main worker's session
+        while not stop_event.wait(interval):
+            try:
+                hb_db = get_db_connection()
+                hb_db.update_task_heartbeat(task)
+                hb_db.disconnect()
+            except Exception:
+                pass
+    t = threading.Thread(target=heartbeat, daemon=True)
+    t.start()
+    return stop_event
+
 def run_collector(reader, last_task):
     db = get_db_connection()
 
@@ -97,6 +114,8 @@ def run_collector(reader, last_task):
         sleep(30)
         db.disconnect()
         return
+
+    heartbeat_stop = start_heartbeat(task)
 
     try:
         reader_connected = False
@@ -145,6 +164,7 @@ def run_collector(reader, last_task):
         if reader_connected:
             reader.log_off()
     except Exception as err:
+        heartbeat_stop.set()
         print(traceback.format_exc())
         print('Putting task back')
         db.rollback()
@@ -156,6 +176,7 @@ def run_collector(reader, last_task):
             pass
         raise
     except KeyboardInterrupt:
+        heartbeat_stop.set()
         print('Putting task back')
         db.rollback()
         db.add_date_task(task, True)
@@ -166,6 +187,7 @@ def run_collector(reader, last_task):
             pass
         raise
 
+    heartbeat_stop.set()
     db.disconnect()
     return task
 
