@@ -818,7 +818,7 @@ class PostgresDatabase():
                 self.active_date_task_builder.fips == int(task['fips']),
                 self.active_date_task_builder.casetype == task['case_type']
             ) \
-            .update({'last_alive': datetime.now()})
+            .update({'last_alive': datetime.now()}, synchronize_session=False)
         self.session.commit()
 
     def reset_stale_tasks(self, stale_threshold_seconds=120):
