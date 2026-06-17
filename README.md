@@ -67,6 +67,14 @@ Run it in a separate terminal alongside your collectors:
 
 Only one instance of the watchdog needs to run regardless of how many collectors you have. It is recommended to always run the watchdog when running collectors.
 
+### Monitor workers with the dashboard
+
+The dashboard gives a live, browser-based view of what the collectors are doing. It reads the database only, so it never interferes with collection. Start it in its own terminal:
+
+        python worker_dashboard.py
+
+It automatically opens your browser to the dashboard and refreshes every 5 seconds. For each court type it shows the active workers (with how long ago each one last sent a heartbeat, highlighting any that have gone stale), the number of pending tasks, how many dates have been searched, and the total cases collected. The dashboard needs Flask, which is already listed in `requirements.txt`.
+
 ## How to generate person ids
 
 Many effective uses of this data require grouping criminal cases to defendant. Unfortunately, the state does not provide any unique identifier, so the [generate_person_ids.py](https://github.com/bschoenfeld/va-court-scraper/blob/master/generate_person_ids.py) script attempts to create one. The script takes all cases and breaks them into groups based on gender, day of birth (there are no years in the case data), and first letter of last name. For each group, every name is compared to every other name using a fuzzy string match. This process can take a while. The script is built so that it can be run in parallel, one execution for each month of the year. I recommend a beefy server - I use a t2.xlarge on AWS, which has 4 CPUs and 16 GB of memory.
