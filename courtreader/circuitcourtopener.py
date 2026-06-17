@@ -2,6 +2,7 @@ from __future__ import absolute_import
 import six.moves.urllib.request, six.moves.urllib.parse, six.moves.urllib.error
 from bs4 import BeautifulSoup
 import time
+import requests
 from .opener import Opener
 
 class CircuitCourtOpener:
@@ -30,7 +31,19 @@ class CircuitCourtOpener:
 
     def open_welcome_page(self):
         url = self.url('circuit.jsp')
-        self.make_request('https://google.com')
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+        })
+        session.get(url)
+
+        try:
+            self.make_request(url)
+        except Exception:
+            pass
+        for name, value in session.cookies.items():
+            self.opener.set_cookie(name, value)
+
         content = self.make_request(url)
         return BeautifulSoup(content, 'html.parser')
 

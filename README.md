@@ -27,7 +27,7 @@ I'll be using AWS, but that's not a requirement.
 
 1. Install dependencies
 
-        pip install selenium mechanize beautifulsoup4 psycopg2 SQLAlchemy GeoAlchemy2 pgcli
+        pip install selenium mechanize beautifulsoup4 psycopg2 SQLAlchemy GeoAlchemy2 pgcli requests
 
 1. Connect to the database and add the postgis extension
 
@@ -41,7 +41,7 @@ I'll be using AWS, but that's not a requirement.
 
 ### Initalize database with list of courts
 
-Running this script will open a chrome window for the district court website. Click the Accept button and solve the captcha. The script will continue automatically once you do. 
+Running this script will populate the database with the list of courts from the state website.
 
         python load_courts_to_db.py
 
@@ -57,7 +57,15 @@ Now you can create collectors. When a collector runs, it will take a task and st
 
         python court_bulk_collector.py district
 
-_Warning - This task system that I've created is pretty terrible and uncompleted tasks can easily be lost. I'd love to replace it with a more robust tool, but I haven't gotten around to it yet. Sorry_
+### Run the task watchdog
+
+The task watchdog prevents tasks from being permanently lost if a collector crashes mid-run. It monitors active tasks and automatically resets any that have not sent a heartbeat in over 2 minutes back to pending, so another worker can pick them up.
+
+Run it in a separate terminal alongside your collectors:
+
+        python task_watchdog.py
+
+Only one instance of the watchdog needs to run regardless of how many collectors you have. It is recommended to always run the watchdog when running collectors.
 
 ## How to generate person ids
 
@@ -125,7 +133,7 @@ git clone https://github.com/bschoenfeld/va-court-scraper.git
 cd va-court-scraper
 virtualenv venv
 source venv/bin/activate
-pip install selenium mechanize beautifulsoup4 psycopg2 SQLAlchemy GeoAlchemy2 pgcli boto3 awscli python-firebase
+pip install selenium mechanize beautifulsoup4 psycopg2 SQLAlchemy GeoAlchemy2 pgcli boto3 awscli python-firebase requests
 export FIREBASE_TOKEN='<FIREBASETOKEN>'
 export PGHOST='<PGHOST>'
 export PGDATABASE='<PGDATABASE>'
