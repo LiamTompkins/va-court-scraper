@@ -4,7 +4,7 @@ import os
 from datetime import datetime, date
 from sqlalchemy import (create_engine, Boolean, Column,
                         Date, DateTime, Integer, BigInteger,
-                        Float, String, ForeignKey, Index, and_)
+                        Float, String, ForeignKey, Index, and_, or_)
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
@@ -824,9 +824,15 @@ class PostgresDatabase():
     def reset_stale_tasks(self, stale_threshold_seconds=120):
         from datetime import timedelta
         cutoff = datetime.now() - timedelta(seconds=stale_threshold_seconds)
+        # Include rows with a NULL last_alive: those are active tasks that never
+        # recorded a heartbeat (e.g. created before the column existed) and would
+        # otherwise never be reset, since NULL < cutoff is never true in SQL.
         stale_tasks = self.session \
             .query(self.active_date_task_builder) \
-            .filter(self.active_date_task_builder.last_alive < cutoff) \
+            .filter(or_(
+                self.active_date_task_builder.last_alive < cutoff,
+                self.active_date_task_builder.last_alive.is_(None)
+            )) \
             .all()
         for task in stale_tasks:
             print('Resetting stale task: fips=%s casetype=%s last_alive=%s' % (
