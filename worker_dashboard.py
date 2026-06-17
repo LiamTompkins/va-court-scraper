@@ -16,12 +16,18 @@ PORT = 5000
 app = Flask(__name__)
 engine = create_engine("postgresql://" + os.environ['POSTGRES_DB'])
 
-# Case tables are created by SQLAlchemy with mixed-case names, so they must be
-# double-quoted when queried directly.
-CASE_TABLES = {
-    'circuit': {'criminal': '"CircuitCriminalCase"', 'civil': '"CircuitCivilCase"'},
-    'district': {'criminal': '"DistrictCriminalCase"', 'civil': '"DistrictCivilCase"'},
+# Case tables are created by SQLAlchemy with mixed-case names. CASE_TABLE_NAMES
+# holds the raw name (for pg_class lookups); queries that hit the table directly
+# must double-quote it.
+CASE_TABLE_NAMES = {
+    'circuit': {'criminal': 'CircuitCriminalCase', 'civil': 'CircuitCivilCase'},
+    'district': {'criminal': 'DistrictCriminalCase', 'civil': 'DistrictCivilCase'},
 }
+
+# Cache of exact case counts, keyed by (court_type, case_type). Only used while a
+# court has no active workers, where the count cannot change, so it stays valid
+# until workers run again.
+_exact_count_cache = {}
 
 
 def scalar(conn, sql):
@@ -30,6 +36,34 @@ def scalar(conn, sql):
         return conn.execute(text(sql)).scalar() or 0
     except Exception:
         return 0
+
+
+def case_count(conn, court_type, case_type, has_active_workers):
+    """Return the case count for a table.
+
+    While workers are active, use PostgreSQL's instant approximate row estimate
+    (pg_class.reltuples) so the 1s refresh never scans the table. Once the court
+    is idle, compute the exact COUNT(*) once and cache it (the count can't change
+    with no workers running) so we still don't rescan every second.
+    """
+    table = CASE_TABLE_NAMES[court_type][case_type]
+    key = (court_type, case_type)
+
+    if has_active_workers:
+        _exact_count_cache.pop(key, None)
+        try:
+            val = conn.execute(
+                text('SELECT reltuples::bigint FROM pg_class WHERE relname = :n'),
+                {'n': table}
+            ).scalar()
+            val = int(val) if val and val > 0 else 0
+        except Exception:
+            val = 0
+        return {'count': val, 'approximate': True}
+
+    if key not in _exact_count_cache:
+        _exact_count_cache[key] = scalar(conn, 'SELECT COUNT(*) FROM "%s"' % table)
+    return {'count': _exact_count_cache[key], 'approximate': False}
 
 
 def collect_court_status(conn, court_type):
@@ -81,6 +115,7 @@ def collect_court_status(conn, court_type):
     except Exception:
         pass
 
+    has_active_workers = len(active) > 0
     return {
         'active': active,
         'completed': completed,
@@ -88,8 +123,8 @@ def collect_court_status(conn, court_type):
         'pending_count': scalar(conn, 'SELECT COUNT(*) FROM %s' % pending_table),
         'dates_searched': scalar(conn, 'SELECT COUNT(*) FROM %s' % searched_table),
         'cases': {
-            'criminal': scalar(conn, 'SELECT COUNT(*) FROM %s' % CASE_TABLES[court_type]['criminal']),
-            'civil': scalar(conn, 'SELECT COUNT(*) FROM %s' % CASE_TABLES[court_type]['civil']),
+            'criminal': case_count(conn, court_type, 'criminal', has_active_workers),
+            'civil': case_count(conn, court_type, 'civil', has_active_workers),
         },
     }
 
@@ -203,6 +238,10 @@ function fmtAgo(s) {
   var m = Math.floor(s / 60);
   return m + 'm ' + (s % 60) + 's ago';
 }
+function fmtCount(c) {
+  // c is {count, approximate}; show ~ while the figure is an estimate
+  return (c.approximate ? '~' : '') + c.count.toLocaleString();
+}
 function fmtWhen(iso) {
   if (!iso) return '';
   var d = new Date(iso);
@@ -230,8 +269,8 @@ function courtCard(name, c) {
       '<div class="stat"><div class="n">' + c.pending_count + '</div><div class="l">Pending</div></div>' +
       '<div class="stat"><div class="n">' + c.completed_count + '</div><div class="l">Completed</div></div>' +
       '<div class="stat"><div class="n">' + c.dates_searched + '</div><div class="l">Dates done</div></div>' +
-      '<div class="stat"><div class="n">' + c.cases.criminal + '</div><div class="l">Criminal cases</div></div>' +
-      '<div class="stat"><div class="n">' + c.cases.civil + '</div><div class="l">Civil cases</div></div>' +
+      '<div class="stat"><div class="n">' + fmtCount(c.cases.criminal) + '</div><div class="l">Criminal cases</div></div>' +
+      '<div class="stat"><div class="n">' + fmtCount(c.cases.civil) + '</div><div class="l">Civil cases</div></div>' +
     '</div>' + table + '</div>';
 }
 var completedPage = 0;
@@ -288,21 +327,29 @@ function changePage(delta) {
   completedPage = Math.max(0, completedPage + delta);
   loadCompleted();
 }
+var ACTIVE_INTERVAL = 1000;
+var IDLE_INTERVAL = 10000;
+function scheduleNext(ms) { setTimeout(refresh, ms); }
 function refresh() {
   fetch('/api/status').then(function(r){ return r.json(); }).then(function(d){
     lastStatus = d;
     document.getElementById('grid').innerHTML =
       courtCard('District', d.courts.district) + courtCard('Circuit', d.courts.circuit);
     loadCompleted();
+    // Poll fast while any worker is active, slowly when everything is idle
+    var anyActive = d.courts.district.active.length + d.courts.circuit.active.length > 0;
+    var interval = anyActive ? ACTIVE_INTERVAL : IDLE_INTERVAL;
     document.getElementById('meta').textContent =
       'Updated ' + new Date(d.generated_at).toLocaleTimeString() +
-      ' · stale after ' + d.stale_threshold_seconds + 's · auto-refresh 5s';
+      ' · stale after ' + d.stale_threshold_seconds + 's · auto-refresh ' +
+      (interval / 1000) + 's · ~ = estimate';
+    scheduleNext(interval);
   }).catch(function(e){
     document.getElementById('meta').textContent = 'Error fetching status: ' + e;
+    scheduleNext(IDLE_INTERVAL);
   });
 }
 refresh();
-setInterval(refresh, 5000);
 </script>
 </body>
 </html>"""

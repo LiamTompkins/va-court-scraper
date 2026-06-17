@@ -73,7 +73,7 @@ The dashboard gives a live, browser-based view of what the collectors are doing.
 
         python worker_dashboard.py
 
-It automatically opens your browser to the dashboard and refreshes every 5 seconds. For each court type it shows the active workers (with how long ago each one last sent a heartbeat, highlighting any that have gone stale), the number of pending tasks, how many dates have been searched, and the total cases collected. The dashboard needs Flask, which is already listed in `requirements.txt`.
+It automatically opens your browser to the dashboard and refreshes every second. For each court type it shows the active workers (with how long ago each one last sent a heartbeat, highlighting any that have gone stale), the number of pending tasks, how many dates have been searched, and the total cases collected. While workers are active, case totals are shown as fast approximate estimates (prefixed with `~`); once a court's workers are idle, the exact count is computed and shown. The dashboard needs Flask, which is already listed in `requirements.txt`.
 
 ## How to generate person ids
 
