@@ -54,6 +54,20 @@ class CircuitCourtActiveDateTask(Base, ActiveDateTask):
 class DistrictCourtActiveDateTask(Base, ActiveDateTask):
     __tablename__ = 'district_court_active_date_tasks'
 
+class CompletedDateTask():
+    id = Column(Integer, primary_key=True)
+    fips = Column(Integer)
+    startdate = Column(Date)
+    enddate = Column(Date)
+    casetype = Column(String)
+    completed_at = Column(DateTime, default=datetime)
+
+class CircuitCourtCompletedDateTask(Base, CompletedDateTask):
+    __tablename__ = 'circuit_court_completed_date_tasks'
+
+class DistrictCourtCompletedDateTask(Base, CompletedDateTask):
+    __tablename__ = 'district_court_completed_date_tasks'
+
 
 class DateSearch():
     id = Column(Integer, primary_key=True)
@@ -630,6 +644,8 @@ TABLES = [
     DistrictCourtDateTask,
     CircuitCourtActiveDateTask,
     DistrictCourtActiveDateTask,
+    CircuitCourtCompletedDateTask,
+    DistrictCourtCompletedDateTask,
 
     # Searches
     CircuitCourtDateSearch,
@@ -702,11 +718,13 @@ class PostgresDatabase():
             self.court_builder = CircuitCourt
             self.date_task_builder = CircuitCourtDateTask
             self.active_date_task_builder = CircuitCourtActiveDateTask
+            self.completed_date_task_builder = CircuitCourtCompletedDateTask
             self.date_search_builder = CircuitCourtDateSearch
         else:
             self.court_builder = DistrictCourt
             self.date_task_builder = DistrictCourtDateTask
             self.active_date_task_builder = DistrictCourtActiveDateTask
+            self.completed_date_task_builder = DistrictCourtCompletedDateTask
             self.date_search_builder = DistrictCourtDateSearch
 
     def commit(self):
@@ -748,6 +766,32 @@ class PostgresDatabase():
                 )
             )
         self.session.commit()
+
+    def add_completed_date_task(self, task):
+        self.session.add(
+            self.completed_date_task_builder(
+                fips=int(task['fips']),
+                startdate=task['start_date'],
+                enddate=task['end_date'],
+                casetype=task['case_type'],
+                completed_at=datetime.now()
+            )
+        )
+        self.session.commit()
+
+    def get_recent_completed_date_tasks(self, limit=25):
+        rows = self.session \
+            .query(self.completed_date_task_builder) \
+            .order_by(self.completed_date_task_builder.completed_at.desc()) \
+            .limit(limit) \
+            .all()
+        return [{
+            'fips': str(r.fips).zfill(3),
+            'start_date': r.startdate,
+            'end_date': r.enddate,
+            'case_type': r.casetype,
+            'completed_at': r.completed_at
+        } for r in rows]
 
     def add_date_task(self, task, stopping_work=False):
         self.session.add(

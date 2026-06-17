@@ -188,6 +188,11 @@ def run_collector(reader, last_task):
         raise
 
     heartbeat_stop.set()
+    # Record the task as completed before disconnecting
+    try:
+        db.add_completed_date_task(task)
+    except Exception:
+        print('Warning: failed to record completed task')
     db.disconnect()
     return task
 
