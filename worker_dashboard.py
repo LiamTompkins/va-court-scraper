@@ -205,6 +205,7 @@ PAGE = """<!DOCTYPE html>
   .meta { color: #8a8f98; font-size: 13px; margin-bottom: 20px; }
   .grid { display: flex; gap: 24px; flex-wrap: wrap; }
   .court { flex: 1; min-width: 420px; background: #171a21; border: 1px solid #262b36; border-radius: 8px; padding: 16px; }
+  .completed-box { flex: 0 1 calc(50% - 12px); max-width: calc(50% - 12px); }
   .court h2 { font-size: 16px; margin: 0 0 12px; text-transform: capitalize; }
   .court h3.section { font-size: 12px; color: #8a8f98; text-transform: uppercase; letter-spacing: .04em; margin: 18px 0 8px; }
   .stats { display: flex; gap: 16px; margin-bottom: 14px; flex-wrap: wrap; }
@@ -246,7 +247,14 @@ function fmtWhen(iso) {
   if (!iso) return '';
   var d = new Date(iso);
   var secs = Math.floor((Date.now() - d.getTime()) / 1000);
-  return fmtAgo(secs);
+  if (secs < 60) return secs + 's ago';
+  if (secs < 3600) return Math.floor(secs / 60) + 'm ago';
+  if (secs < 86400) {
+    var h = Math.floor(secs / 3600);
+    var m = Math.floor((secs % 3600) / 60);
+    return h + 'h ' + m + 'm ago';
+  }
+  return Math.round(secs / 86400) + 'd ago';
 }
 function courtCard(name, c) {
   var rows = c.active.map(function(t) {
@@ -302,7 +310,7 @@ function renderCompleted(data) {
   var dCount = lastStatus ? lastStatus.courts.district.completed_count : 0;
   var cCount = lastStatus ? lastStatus.courts.circuit.completed_count : 0;
   document.getElementById('grid-completed').innerHTML =
-    '<div class="court">' +
+    '<div class="court completed-box">' +
     '<h2>Completed tasks</h2>' +
     '<div class="stats">' +
       '<div class="stat"><div class="n">' + data.total + '</div><div class="l">Total completed</div></div>' +
