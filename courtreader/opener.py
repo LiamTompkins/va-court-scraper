@@ -33,30 +33,47 @@ class Opener:
     def open(self, *args):
         import time
         import socket
+        from six.moves.urllib.error import URLError
 
         url = args[0]
         data = args[1] if len(args) == 2 else None
-        
-        for attempt in range(2):
+
+        max_attempts = 4
+        for attempt in range(max_attempts):
             try:
                 if data:
                     page = self.opener.open(url, data, timeout=120)
                 else:
                     page = self.opener.open(url, timeout=120)
-                
+
                 content = page.read()
                 page.close()
-                
+
                 class DummyPage:
                     def __init__(self, c):
                         self.c = c
                     def read(self):
                         return self.c
-                
+
                 return DummyPage(content)
-            
+
             except Exception as e:
-                # Catch timeout errors to prevent losing the session
-                if isinstance(e, socket.timeout) or "timeout" in str(e).lower() or "read operation" in str(e).lower():
-                    print('Network timeout in opener')
+                # Retry transient network errors (dropped/reset connections,
+                # timeouts) instead of letting one bubble up and cost the whole
+                # task a 10-minute back-off. Only give up after max_attempts.
+                msg = str(e).lower()
+                transient = (
+                    isinstance(e, (socket.timeout, socket.error, URLError, ConnectionError))
+                    or 'timeout' in msg
+                    or 'read operation' in msg
+                    or 'forcibly closed' in msg
+                    or 'connection reset' in msg
+                    or '10054' in msg
+                )
+                if transient and attempt < max_attempts - 1:
+                    wait = 5 * (attempt + 1)
+                    print('Network error in opener (%s). Retry %d/%d in %ds...' % (
+                        e, attempt + 1, max_attempts - 1, wait))
+                    time.sleep(wait)
+                    continue
                 raise
