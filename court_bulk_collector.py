@@ -8,6 +8,7 @@ import time
 import traceback
 import socket
 import threading
+from sqlalchemy import create_engine, text
 
 # Prevent infinite hangs on network sockets (which blocks Ctrl-C in Windows)
 socket.setdefaulttimeout(60)
@@ -91,14 +92,37 @@ def get_cases_on_date(db, reader, fips, case_type, date, dateStr):
 
 def start_heartbeat(task, interval=30):
     stop_event = threading.Event()
+    active_table = '%s_court_active_date_tasks' % COURT_TYPE
+    update_sql = text(
+        'UPDATE %s SET last_alive = :now WHERE fips = :fips AND casetype = :ct'
+        % active_table
+    )
     def heartbeat():
-        # Use a separate DB connection so the heartbeat doesn't interfere
-        # with the main worker's session
+        # Build one lightweight engine for the whole heartbeat and reuse it.
+        # This avoids reconstructing PostgresDatabase every tick (which re-runs
+        # table-creation/migration checks) and issues only a minimal UPDATE.
+        engine = None
+        params = {
+            'fips': int(task['fips']),
+            'ct': task['case_type'],
+        }
         while not stop_event.wait(interval):
             try:
-                hb_db = get_db_connection()
-                hb_db.update_task_heartbeat(task)
-                hb_db.disconnect()
+                if engine is None:
+                    engine = create_engine('postgresql://' + os.environ['POSTGRES_DB'])
+                params['now'] = datetime.datetime.now()
+                with engine.begin() as conn:
+                    conn.execute(update_sql, params)
+            except Exception:
+                if engine is not None:
+                    try:
+                        engine.dispose()
+                    except Exception:
+                        pass
+                    engine = None
+        if engine is not None:
+            try:
+                engine.dispose()
             except Exception:
                 pass
     t = threading.Thread(target=heartbeat, daemon=True)

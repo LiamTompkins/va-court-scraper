@@ -704,13 +704,21 @@ class PostgresDatabase():
         for table in TABLES:
             table.__table__.create(self.engine, checkfirst=True) #pylint: disable=E1101
 
-        # Add last_alive column to active task tables if it doesn't exist yet
+        # Add last_alive column to active task tables if it doesn't exist yet.
+        # Only ALTER when the column is actually missing: ALTER TABLE takes an
+        # ACCESS EXCLUSIVE lock even for "ADD COLUMN IF NOT EXISTS", so running
+        # it on every connection serializes against heartbeat updates and reads.
         from sqlalchemy import text
         with self.engine.connect() as conn:
             for table_name in ['circuit_court_active_date_tasks', 'district_court_active_date_tasks']:
-                conn.execute(
-                    text("ALTER TABLE %s ADD COLUMN IF NOT EXISTS last_alive TIMESTAMP" % table_name)
-                )
+                exists = conn.execute(text(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_name = :t AND column_name = 'last_alive'"
+                ), {'t': table_name}).scalar()
+                if not exists:
+                    conn.execute(
+                        text("ALTER TABLE %s ADD COLUMN last_alive TIMESTAMP" % table_name)
+                    )
             conn.commit()
 
         self.court_type = court_type
@@ -854,16 +862,6 @@ class PostgresDatabase():
             except IntegrityError:
                 print('WARNING - FAILED TO GET NEW TASK')
                 self.session.rollback()
-
-    def update_task_heartbeat(self, task):
-        self.session \
-            .query(self.active_date_task_builder) \
-            .filter(
-                self.active_date_task_builder.fips == int(task['fips']),
-                self.active_date_task_builder.casetype == task['case_type']
-            ) \
-            .update({'last_alive': datetime.now()}, synchronize_session=False)
-        self.session.commit()
 
     def reset_stale_tasks(self, stale_threshold_seconds=120):
         from datetime import timedelta
