@@ -69,11 +69,15 @@ Only one instance of the watchdog needs to run regardless of how many collectors
 
 ### Monitor workers with the dashboard
 
-The dashboard gives a live, browser-based view of what the collectors are doing. It reads the database only, so it never interferes with collection. Start it in its own terminal:
+The dashboard gives a live, browser-based view of what the collectors are doing, and lets you schedule new collection tasks. Start it in its own terminal:
 
         python worker_dashboard.py
 
-It automatically opens your browser to the dashboard and refreshes every second. For each court type it shows the active workers (with how long ago each one last sent a heartbeat, highlighting any that have gone stale), the number of pending tasks, how many dates have been searched, and the total cases collected. While workers are active, case totals are shown as fast approximate estimates (prefixed with `~`); once a court's workers are idle, the exact count is computed and shown. The dashboard needs Flask, which is already listed in `requirements.txt`.
+It automatically opens your browser to the dashboard and refreshes every second. For each court type it shows the active workers (with how long ago each one last sent a heartbeat, highlighting any that have gone stale), the number of pending tasks, how many dates have been searched, and the total cases collected. While workers are active, case totals are shown as fast approximate estimates (prefixed with `~`); once a court's workers are idle, the exact count is computed and shown.
+
+The "Schedule tasks" form at the top creates collection tasks without the command line - the same as running `court_bulk_task_creator.py`. Choose a court level, case type, and a descending date range (start date on or after end date); leave FIPS blank to create a task for every court, or enter one to target a single court. Newly created tasks appear in the pending count and are picked up by any running collectors.
+
+The dashboard needs Flask, which is already listed in `requirements.txt`.
 
 ## How to generate person ids
 

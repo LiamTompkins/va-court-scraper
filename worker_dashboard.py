@@ -189,6 +189,52 @@ def completed():
     })
 
 
+@app.route('/api/tasks/create', methods=['POST'])
+def create_tasks():
+    data = request.get_json(force=True, silent=True) or {}
+    court_type = (data.get('court_type') or '').strip()
+    case_type = (data.get('case_type') or '').strip()
+    start_s = (data.get('start_date') or '').strip()
+    end_s = (data.get('end_date') or '').strip()
+    fips = (data.get('fips') or '').strip()
+
+    if court_type not in ('circuit', 'district'):
+        return jsonify({'ok': False, 'error': 'Invalid court level'}), 400
+    if case_type not in ('criminal', 'civil'):
+        return jsonify({'ok': False, 'error': 'Invalid case type'}), 400
+    try:
+        start_date = datetime.strptime(start_s, '%Y-%m-%d').date()
+        end_date = datetime.strptime(end_s, '%Y-%m-%d').date()
+    except ValueError:
+        return jsonify({'ok': False, 'error': 'Invalid date (use YYYY-MM-DD)'}), 400
+    # Tasks descend from start_date down to end_date, so start must not precede end.
+    if start_date < end_date:
+        return jsonify({'ok': False, 'error': 'Start date must be on or after end date'}), 400
+    if fips:
+        try:
+            fips_list = [int(fips)]
+        except ValueError:
+            return jsonify({'ok': False, 'error': 'FIPS must be numeric'}), 400
+
+    courts_table = '%s_courts' % court_type
+    tasks_table = '%s_court_date_tasks' % court_type
+    try:
+        with engine.begin() as conn:
+            if not fips:
+                fips_list = [r[0] for r in conn.execute(text('SELECT fips FROM %s' % courts_table))]
+            if not fips_list:
+                return jsonify({'ok': False, 'error': 'No courts found - load courts first'}), 400
+            for f in fips_list:
+                conn.execute(
+                    text('INSERT INTO %s (fips, startdate, enddate, casetype) '
+                         'VALUES (:fips, :sd, :ed, :ct)' % tasks_table),
+                    {'fips': int(f), 'sd': start_date, 'ed': end_date, 'ct': case_type}
+                )
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+    return jsonify({'ok': True, 'created': len(fips_list)})
+
+
 @app.route('/')
 def index():
     return PAGE
@@ -206,6 +252,14 @@ PAGE = """<!DOCTYPE html>
   .grid { display: flex; gap: 24px; flex-wrap: wrap; }
   .court { flex: 1; min-width: 420px; background: #171a21; border: 1px solid #262b36; border-radius: 8px; padding: 16px; }
   .completed-box { flex: 0 1 calc(50% - 12px); max-width: calc(50% - 12px); }
+  .scheduler { background: #171a21; border: 1px solid #262b36; border-radius: 8px; padding: 16px; margin-bottom: 24px; }
+  .scheduler h2 { font-size: 16px; margin: 0 0 12px; }
+  .scheduler .row { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
+  .scheduler label { display: flex; flex-direction: column; font-size: 11px; color: #8a8f98; text-transform: uppercase; letter-spacing: .04em; gap: 4px; }
+  .scheduler select, .scheduler input { background: #0f1115; color: #e6e6e6; border: 1px solid #30363d; border-radius: 6px; padding: 6px 8px; font-size: 13px; }
+  .scheduler button { background: #238636; color: #fff; border: 1px solid #2ea043; border-radius: 6px; padding: 7px 16px; cursor: pointer; font-size: 13px; }
+  .scheduler button:hover { background: #2ea043; }
+  .scheduler .msg { margin-left: 8px; font-size: 13px; color: #8a8f98; }
   .court h2 { font-size: 16px; margin: 0 0 12px; text-transform: capitalize; }
   .court h3.section { font-size: 12px; color: #8a8f98; text-transform: uppercase; letter-spacing: .04em; margin: 18px 0 8px; }
   .stats { display: flex; gap: 16px; margin-bottom: 14px; flex-wrap: wrap; }
@@ -230,6 +284,28 @@ PAGE = """<!DOCTYPE html>
 <body>
   <h1>Virginia Court Scraper &mdash; Worker Dashboard</h1>
   <div class="meta" id="meta">Loading&hellip;</div>
+  <div class="scheduler">
+    <h2>Schedule tasks</h2>
+    <div class="row">
+      <label>Court level
+        <select id="sch-court"><option value="district">district</option><option value="circuit">circuit</option></select>
+      </label>
+      <label>Case type
+        <select id="sch-case"><option value="criminal">criminal</option><option value="civil">civil</option></select>
+      </label>
+      <label>Start (most recent)
+        <input type="date" id="sch-start">
+      </label>
+      <label>End (earliest)
+        <input type="date" id="sch-end">
+      </label>
+      <label>FIPS (optional)
+        <input type="text" id="sch-fips" placeholder="all courts" size="10">
+      </label>
+      <button onclick="createTasks()">Create tasks</button>
+      <span class="msg" id="sch-msg"></span>
+    </div>
+  </div>
   <div class="grid" id="grid"></div>
   <div class="grid" id="grid-completed" style="margin-top:24px;"></div>
 <script>
@@ -238,6 +314,26 @@ function fmtAgo(s) {
   if (s < 60) return s + 's ago';
   var m = Math.floor(s / 60);
   return m + 'm ' + (s % 60) + 's ago';
+}
+function createTasks() {
+  var msg = document.getElementById('sch-msg');
+  var body = {
+    court_type: document.getElementById('sch-court').value,
+    case_type: document.getElementById('sch-case').value,
+    start_date: document.getElementById('sch-start').value,
+    end_date: document.getElementById('sch-end').value,
+    fips: document.getElementById('sch-fips').value
+  };
+  if (!body.start_date || !body.end_date) { msg.textContent = 'Pick start and end dates.'; return; }
+  msg.textContent = 'Creating…';
+  fetch('/api/tasks/create', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  }).then(function(r){ return r.json(); }).then(function(d){
+    if (d.ok) { msg.textContent = 'Created ' + d.created + ' task(s).'; refresh(); }
+    else { msg.textContent = 'Error: ' + d.error; }
+  }).catch(function(e){ msg.textContent = 'Error: ' + e; });
 }
 function fmtCount(c) {
   // c is {count, approximate}; show ~ while the figure is an estimate
