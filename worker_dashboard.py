@@ -19,6 +19,30 @@ PORT = 5000
 app = Flask(__name__)
 engine = create_engine("postgresql://" + os.environ['POSTGRES_DB'])
 
+
+def ensure_schema():
+    """Create the worker presence/target tables if they don't exist yet, so the
+    dashboard and supervisor work even before a collector has built the schema."""
+    ddl = [
+        'CREATE TABLE IF NOT EXISTS workers ('
+        ' worker_id VARCHAR PRIMARY KEY, court_type VARCHAR, status VARCHAR,'
+        ' fips INTEGER, case_type VARCHAR, last_alive TIMESTAMP)',
+        'CREATE TABLE IF NOT EXISTS worker_targets ('
+        ' court_type VARCHAR PRIMARY KEY, desired_count INTEGER, updated_at TIMESTAMP)',
+    ]
+    try:
+        with engine.begin() as conn:
+            for stmt in ddl:
+                conn.execute(text(stmt))
+    except Exception:
+        pass
+
+
+ensure_schema()
+
+# The court site becomes unstable past ~10 collectors, so cap the desired count.
+MAX_WORKERS = 10
+
 # Case tables are created by SQLAlchemy with mixed-case names. CASE_TABLE_NAMES
 # holds the raw name (for pg_class lookups); queries that hit the table directly
 # must double-quote it.
@@ -135,11 +159,30 @@ def collect_court_status(conn, court_type):
     except Exception:
         pass
 
+    # Desired count (set via the dashboard) vs. actual running collectors.
+    desired_count = 0
+    running_count = 0
+    try:
+        d = conn.execute(text(
+            'SELECT desired_count FROM worker_targets WHERE court_type = :ct'
+        ), {'ct': court_type}).scalar()
+        desired_count = int(d) if d is not None else 0
+    except Exception:
+        pass
+    try:
+        running_count = conn.execute(text(
+            'SELECT COUNT(*) FROM workers WHERE court_type = :ct'
+        ), {'ct': court_type}).scalar() or 0
+    except Exception:
+        pass
+
     has_active_workers = len(active) > 0
     return {
         'active': active,
         'idle': idle,
         'idle_count': len(idle),
+        'desired_count': desired_count,
+        'running_count': running_count,
         'completed': completed,
         'completed_count': scalar(conn, 'SELECT COUNT(*) FROM %s' % completed_table),
         'pending_count': scalar(conn, 'SELECT COUNT(*) FROM %s' % pending_table),
@@ -267,6 +310,30 @@ def create_tasks():
     return jsonify({'ok': True, 'created': len(fips_list)})
 
 
+@app.route('/api/workers/target', methods=['POST'])
+def set_worker_target():
+    data = request.get_json(force=True, silent=True) or {}
+    court_type = (data.get('court_type') or '').strip()
+    if court_type not in ('circuit', 'district'):
+        return jsonify({'ok': False, 'error': 'Invalid court level'}), 400
+    try:
+        desired = int(data.get('desired_count'))
+    except (TypeError, ValueError):
+        return jsonify({'ok': False, 'error': 'desired_count must be a number'}), 400
+    desired = max(0, min(MAX_WORKERS, desired))
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                'INSERT INTO worker_targets (court_type, desired_count, updated_at) '
+                'VALUES (:ct, :dc, :now) '
+                'ON CONFLICT (court_type) DO UPDATE SET '
+                'desired_count = EXCLUDED.desired_count, updated_at = EXCLUDED.updated_at'
+            ), {'ct': court_type, 'dc': desired, 'now': datetime.now()})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+    return jsonify({'ok': True, 'court_type': court_type, 'desired_count': desired})
+
+
 @app.route('/')
 def index():
     return PAGE
@@ -293,6 +360,13 @@ PAGE = """<!DOCTYPE html>
   .scheduler button:hover { background: #2ea043; }
   .scheduler .msg { margin-left: 8px; font-size: 13px; color: #8a8f98; }
   .court h2 { font-size: 16px; margin: 0 0 12px; text-transform: capitalize; }
+  .court-head { display: flex; align-items: center; justify-content: space-between; }
+  .court-head h2 { margin: 0 0 12px; }
+  .worker-ctl { display: flex; align-items: center; gap: 6px; font-size: 13px; color: #8a8f98; }
+  .worker-ctl .run { color: #e6e6e6; }
+  .worker-ctl .lbl { font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+  .worker-ctl button { background: #21262d; color: #e6e6e6; border: 1px solid #30363d; border-radius: 6px; width: 24px; height: 24px; cursor: pointer; font-size: 14px; line-height: 1; }
+  .worker-ctl button:hover { background: #30363d; }
   .court h3.section { font-size: 12px; color: #8a8f98; text-transform: uppercase; letter-spacing: .04em; margin: 18px 0 8px; }
   .stats { display: flex; gap: 16px; margin-bottom: 14px; flex-wrap: wrap; }
   .stat { background: #0f1115; border-radius: 6px; padding: 8px 12px; min-width: 90px; }
@@ -350,6 +424,14 @@ function fmtAgo(s) {
   if (s < 60) return s + 's ago';
   var m = Math.floor(s / 60);
   return m + 'm ' + (s % 60) + 's ago';
+}
+function setTarget(court, desired) {
+  if (desired < 0) desired = 0;
+  fetch('/api/workers/target', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({court_type: court, desired_count: desired})
+  }).then(function(r){ return r.json(); }).then(function(d){ if (d.ok) refresh(); });
 }
 function createTasks() {
   var msg = document.getElementById('sch-msg');
@@ -411,8 +493,17 @@ function courtCard(name, c) {
     ? '<table><tr><th>Status</th><th>FIPS</th><th>Type</th><th>Date range</th><th>Last heartbeat</th></tr>' + allRows + '</table>'
     : '<div class="empty">No workers</div>';
 
+  var ct = name.toLowerCase();
+  var desired = c.desired_count || 0;
+  var workerCtl = '<div class="worker-ctl">' +
+    '<span class="run">' + (c.running_count || 0) + ' running</span> / ' +
+    '<button onclick="setTarget(&#39;' + ct + '&#39;,' + (desired - 1) + ')">&minus;</button>' +
+    '<b>' + desired + '</b>' +
+    '<button onclick="setTarget(&#39;' + ct + '&#39;,' + (desired + 1) + ')">+</button>' +
+    '<span class="lbl">desired</span></div>';
+
   return '<div class="court">' +
-    '<h2>' + name + '</h2>' +
+    '<div class="court-head"><h2>' + name + '</h2>' + workerCtl + '</div>' +
     '<div class="stats">' +
       '<div class="stat"><div class="n">' + c.pending_count + '</div><div class="l">Pending</div></div>' +
       '<div class="stat"><div class="n">' + c.completed_count + '</div><div class="l">Completed</div></div>' +
@@ -476,8 +567,15 @@ function changePage(delta) {
 }
 var ACTIVE_INTERVAL = 1000;
 var IDLE_INTERVAL = 10000;
-function scheduleNext(ms) { setTimeout(refresh, ms); }
+var refreshTimer = null;
+function scheduleNext(ms) {
+  if (refreshTimer) clearTimeout(refreshTimer);
+  refreshTimer = setTimeout(refresh, ms);
+}
 function refresh() {
+  // Cancel any pending tick so manual refreshes (e.g. from the worker control
+  // or task scheduler) restart the single loop instead of spawning extra ones.
+  if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null; }
   fetch('/api/status').then(function(r){ return r.json(); }).then(function(d){
     lastStatus = d;
     document.getElementById('grid').innerHTML =

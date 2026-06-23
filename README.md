@@ -79,6 +79,16 @@ The "Schedule tasks" form at the top creates collection tasks without the comman
 
 The dashboard needs Flask, which is already listed in `requirements.txt`.
 
+### Start workers from the dashboard
+
+Each court card has a worker control showing how many collectors are running and a desired count you can raise or lower with the `+` / `-` buttons. The dashboard only writes the desired number to the database - it never spawns processes itself. A supervisor process does the spawning, so this works the same whether you run everything on one machine or across several servers.
+
+On every machine that should host collectors, run the supervisor:
+
+        python worker_supervisor.py
+
+The supervisor polls the desired count and starts or stops local `court_bulk_collector.py` processes to match (capped at 10, since the court site becomes unstable past that). On Windows each collector opens in its own console window so its logs stay visible. To scale across servers, run one supervisor per machine - the desired count is shared through the database, and the dashboard's "running" figure reflects the actual collectors that have registered.
+
 ## How to generate person ids
 
 Many effective uses of this data require grouping criminal cases to defendant. Unfortunately, the state does not provide any unique identifier, so the [generate_person_ids.py](https://github.com/bschoenfeld/va-court-scraper/blob/master/generate_person_ids.py) script attempts to create one. The script takes all cases and breaks them into groups based on gender, day of birth (there are no years in the case data), and first letter of last name. For each group, every name is compared to every other name using a fuzzy string match. This process can take a while. The script is built so that it can be run in parallel, one execution for each month of the year. I recommend a beefy server - I use a t2.xlarge on AWS, which has 4 CPUs and 16 GB of memory.

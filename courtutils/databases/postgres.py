@@ -79,6 +79,15 @@ class Worker(Base):
     case_type = Column(String)    # populated while working
     last_alive = Column(DateTime)
 
+# Desired number of collector processes per court type. The dashboard writes
+# this; a worker_supervisor.py on each host reads it and starts/stops local
+# collectors to match.
+class WorkerTarget(Base):
+    __tablename__ = 'worker_targets'
+    court_type = Column(String, primary_key=True)
+    desired_count = Column(Integer)
+    updated_at = Column(DateTime)
+
 
 class DateSearch():
     id = Column(Integer, primary_key=True)
@@ -660,6 +669,7 @@ TABLES = [
 
     # Workers
     Worker,
+    WorkerTarget,
 
     # Searches
     CircuitCourtDateSearch,
