@@ -36,6 +36,62 @@ def get_db_connection():
         return PostgresDatabase(COURT_TYPE)
     return None
 
+# Identify this collector process so the dashboard can show it even when idle.
+WORKER_ID = '%s-%d' % (socket.gethostname(), os.getpid())
+_worker_state = {'status': 'idle', 'fips': None, 'case_type': None}
+_worker_state_lock = threading.Lock()
+# Set whenever the worker state changes, so the presence thread writes the new
+# status immediately instead of waiting for its next interval.
+_worker_state_changed = threading.Event()
+
+def set_worker_state(status, fips=None, case_type=None):
+    with _worker_state_lock:
+        _worker_state['status'] = status
+        _worker_state['fips'] = int(fips) if fips else None
+        _worker_state['case_type'] = case_type
+    _worker_state_changed.set()
+
+def start_worker_presence(interval=15):
+    # Periodically record this process in the workers table (upsert keyed on
+    # worker_id) so the dashboard sees it whether working or idle. Reuses one
+    # lightweight engine.
+    upsert_sql = text(
+        'INSERT INTO workers (worker_id, court_type, status, fips, case_type, last_alive) '
+        'VALUES (:wid, :ct, :status, :fips, :case_type, :now) '
+        'ON CONFLICT (worker_id) DO UPDATE SET '
+        'status = EXCLUDED.status, fips = EXCLUDED.fips, '
+        'case_type = EXCLUDED.case_type, last_alive = EXCLUDED.last_alive'
+    )
+    def beat():
+        engine = None
+        while True:
+            try:
+                if engine is None:
+                    engine = create_engine('postgresql://' + os.environ['POSTGRES_DB'])
+                with _worker_state_lock:
+                    st = dict(_worker_state)
+                with engine.begin() as conn:
+                    conn.execute(upsert_sql, {
+                        'wid': WORKER_ID,
+                        'ct': COURT_TYPE,
+                        'status': st['status'],
+                        'fips': st['fips'],
+                        'case_type': st['case_type'],
+                        'now': datetime.datetime.now(),
+                    })
+            except Exception:
+                if engine is not None:
+                    try:
+                        engine.dispose()
+                    except Exception:
+                        pass
+                    engine = None
+            # Wake early (and write again) as soon as the state changes.
+            if _worker_state_changed.wait(interval):
+                _worker_state_changed.clear()
+    t = threading.Thread(target=beat, daemon=True)
+    t.start()
+
 def get_cases_on_date(db, reader, fips, case_type, date, dateStr):
     print('Getting cases on ' + dateStr)
     sleep(1)
@@ -134,11 +190,13 @@ def run_collector(reader, last_task):
 
     task = db.get_and_delete_date_task(last_task)
     if task is None:
+        set_worker_state('idle')
         print('Nothing to do. Sleeping for 30 seconds.')
         sleep(30)
         db.disconnect()
         return
 
+    set_worker_state('working', task['fips'], task['case_type'])
     heartbeat_stop = start_heartbeat(task)
 
     try:
@@ -225,6 +283,14 @@ def get_reader():
             readers.DistrictCourtReader()
 
 def run():
+    # Make sure the schema (incl. the workers table) exists, then start
+    # reporting this process's presence so the dashboard can show it when idle.
+    try:
+        get_db_connection().disconnect()
+    except Exception:
+        pass
+    start_worker_presence()
+
     reader = None
     finished_task = None
     while True:
@@ -233,6 +299,7 @@ def run():
                 reader = get_reader()
             finished_task = run_collector(reader, finished_task)
         except Exception as err:
+            set_worker_state('idle')
             try:
                 reader.log_off()
             except:

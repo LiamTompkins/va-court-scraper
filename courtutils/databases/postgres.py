@@ -68,6 +68,17 @@ class CircuitCourtCompletedDateTask(Base, CompletedDateTask):
 class DistrictCourtCompletedDateTask(Base, CompletedDateTask):
     __tablename__ = 'district_court_completed_date_tasks'
 
+# Tracks each running collector process so the dashboard can show workers even
+# when they are idle (between tasks), not just when they hold an active task.
+class Worker(Base):
+    __tablename__ = 'workers'
+    worker_id = Column(String, primary_key=True)
+    court_type = Column(String)
+    status = Column(String)       # 'working' or 'idle'
+    fips = Column(Integer)        # populated while working
+    case_type = Column(String)    # populated while working
+    last_alive = Column(DateTime)
+
 
 class DateSearch():
     id = Column(Integer, primary_key=True)
@@ -646,6 +657,9 @@ TABLES = [
     DistrictCourtActiveDateTask,
     CircuitCourtCompletedDateTask,
     DistrictCourtCompletedDateTask,
+
+    # Workers
+    Worker,
 
     # Searches
     CircuitCourtDateSearch,

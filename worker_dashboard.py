@@ -3,7 +3,7 @@ from __future__ import print_function
 import os
 import threading
 import webbrowser
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from flask import Flask, jsonify, request
 from sqlalchemy import create_engine, text
@@ -11,6 +11,9 @@ from sqlalchemy import create_engine, text
 # Seconds without a heartbeat before an active task is considered stale.
 # Matches the threshold used by task_watchdog.py.
 STALE_THRESHOLD_SECONDS = 120
+# Seconds without a presence heartbeat before a worker process is treated as
+# gone and dropped from the dashboard.
+WORKER_STALE_SECONDS = 90
 PORT = 5000
 
 app = Flask(__name__)
@@ -115,9 +118,28 @@ def collect_court_status(conn, court_type):
     except Exception:
         pass
 
+    # Idle workers come from the workers table (working ones are already shown
+    # via their active task above).
+    idle = []
+    try:
+        now = datetime.now()
+        rows = conn.execute(text(
+            "SELECT worker_id, last_alive FROM workers "
+            "WHERE court_type = :ct AND status = 'idle' ORDER BY last_alive DESC"
+        ), {'ct': court_type})
+        for r in rows:
+            idle.append({
+                'worker_id': r[0],
+                'seconds_since': int((now - r[1]).total_seconds()) if r[1] else None,
+            })
+    except Exception:
+        pass
+
     has_active_workers = len(active) > 0
     return {
         'active': active,
+        'idle': idle,
+        'idle_count': len(idle),
         'completed': completed,
         'completed_count': scalar(conn, 'SELECT COUNT(*) FROM %s' % completed_table),
         'pending_count': scalar(conn, 'SELECT COUNT(*) FROM %s' % pending_table),
@@ -131,7 +153,15 @@ def collect_court_status(conn, court_type):
 
 @app.route('/api/status')
 def status():
-    with engine.connect() as conn:
+    with engine.begin() as conn:
+        # Drop workers that have stopped sending presence heartbeats.
+        try:
+            conn.execute(
+                text('DELETE FROM workers WHERE last_alive < :cutoff'),
+                {'cutoff': datetime.now() - timedelta(seconds=WORKER_STALE_SECONDS)}
+            )
+        except Exception:
+            pass
         data = {
             'generated_at': datetime.now().isoformat(),
             'stale_threshold_seconds': STALE_THRESHOLD_SECONDS,
@@ -207,9 +237,11 @@ def create_tasks():
         end_date = datetime.strptime(end_s, '%Y-%m-%d').date()
     except ValueError:
         return jsonify({'ok': False, 'error': 'Invalid date (use YYYY-MM-DD)'}), 400
-    # Tasks descend from start_date down to end_date, so start must not precede end.
+    # The form's "End (latest)" maps to start_date and "Start (earliest)" to
+    # end_date. Collectors descend from start_date down to end_date, so the
+    # most-recent date (start_date) must not precede the earliest (end_date).
     if start_date < end_date:
-        return jsonify({'ok': False, 'error': 'Start date must be on or after end date'}), 400
+        return jsonify({'ok': False, 'error': 'Start date must be on or before end date'}), 400
     if fips:
         try:
             fips_list = [int(fips)]
@@ -252,7 +284,7 @@ PAGE = """<!DOCTYPE html>
   .grid { display: flex; gap: 24px; flex-wrap: wrap; }
   .court { flex: 1; min-width: 420px; background: #171a21; border: 1px solid #262b36; border-radius: 8px; padding: 16px; }
   .completed-box { flex: 0 1 calc(50% - 12px); max-width: calc(50% - 12px); }
-  .scheduler { background: #171a21; border: 1px solid #262b36; border-radius: 8px; padding: 16px; margin-bottom: 24px; }
+  .scheduler { background: #171a21; border: 1px solid #262b36; border-radius: 8px; padding: 16px; }
   .scheduler h2 { font-size: 16px; margin: 0 0 12px; }
   .scheduler .row { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; }
   .scheduler label { display: flex; flex-direction: column; font-size: 11px; color: #8a8f98; text-transform: uppercase; letter-spacing: .04em; gap: 4px; }
@@ -275,6 +307,8 @@ PAGE = """<!DOCTYPE html>
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
   .dot.ok { background: #3fb950; }
   .dot.stale { background: #f85149; }
+  .dot.idle { background: #8a8f98; }
+  .muted { color: #8a8f98; }
   .pager { display: flex; align-items: center; gap: 12px; margin-top: 12px; font-size: 13px; color: #8a8f98; }
   .pager button { background: #21262d; color: #e6e6e6; border: 1px solid #30363d; border-radius: 6px; padding: 5px 12px; cursor: pointer; }
   .pager button:hover:not([disabled]) { background: #30363d; }
@@ -284,30 +318,32 @@ PAGE = """<!DOCTYPE html>
 <body>
   <h1>Virginia Court Scraper &mdash; Worker Dashboard</h1>
   <div class="meta" id="meta">Loading&hellip;</div>
-  <div class="scheduler">
-    <h2>Schedule tasks</h2>
-    <div class="row">
-      <label>Court level
-        <select id="sch-court"><option value="district">district</option><option value="circuit">circuit</option></select>
-      </label>
-      <label>Case type
-        <select id="sch-case"><option value="criminal">criminal</option><option value="civil">civil</option></select>
-      </label>
-      <label>Start (most recent)
-        <input type="date" id="sch-start">
-      </label>
-      <label>End (earliest)
-        <input type="date" id="sch-end">
-      </label>
-      <label>FIPS (optional)
-        <input type="text" id="sch-fips" placeholder="all courts" size="10">
-      </label>
-      <button onclick="createTasks()">Create tasks</button>
-      <span class="msg" id="sch-msg"></span>
-    </div>
-  </div>
   <div class="grid" id="grid"></div>
-  <div class="grid" id="grid-completed" style="margin-top:24px;"></div>
+  <div class="grid" id="grid-completed" style="margin-top:24px;">
+    <div class="scheduler completed-box">
+      <h2>Schedule tasks</h2>
+      <div class="row">
+        <label>Court level
+          <select id="sch-court"><option value="district">district</option><option value="circuit">circuit</option></select>
+        </label>
+        <label>Case type
+          <select id="sch-case"><option value="criminal">criminal</option><option value="civil">civil</option></select>
+        </label>
+        <label>Start (earliest)
+          <input type="date" id="sch-end">
+        </label>
+        <label>End (latest)
+          <input type="date" id="sch-start">
+        </label>
+        <label>FIPS (optional)
+          <input type="text" id="sch-fips" placeholder="all courts" size="10">
+        </label>
+        <button onclick="createTasks()">Create tasks</button>
+        <span class="msg" id="sch-msg"></span>
+      </div>
+    </div>
+    <div class="court completed-box" id="completed-card"></div>
+  </div>
 <script>
 function fmtAgo(s) {
   if (s === null) return 'no heartbeat';
@@ -356,20 +392,28 @@ function courtCard(name, c) {
   var rows = c.active.map(function(t) {
     var cls = t.stale ? 'stale' : 'ok';
     return '<tr>' +
-      '<td><span class="dot ' + cls + '"></span>' + t.fips + '</td>' +
+      '<td><span class="dot ' + cls + '"></span>working</td>' +
+      '<td>' + t.fips + '</td>' +
       '<td>' + t.case_type + '</td>' +
       '<td>' + (t.start_date || '') + ' → ' + (t.end_date || '') + '</td>' +
       '<td class="' + cls + '">' + fmtAgo(t.seconds_since) + '</td>' +
       '</tr>';
   }).join('');
-  var table = c.active.length
-    ? '<table><tr><th>FIPS</th><th>Type</th><th>Date range</th><th>Last heartbeat</th></tr>' + rows + '</table>'
-    : '<div class="empty">No active workers</div>';
+  var idleRows = (c.idle || []).map(function(w) {
+    return '<tr>' +
+      '<td><span class="dot idle"></span>idle</td>' +
+      '<td colspan="3" class="muted">' + w.worker_id + '</td>' +
+      '<td>' + fmtAgo(w.seconds_since) + '</td>' +
+      '</tr>';
+  }).join('');
+  var allRows = rows + idleRows;
+  var table = allRows
+    ? '<table><tr><th>Status</th><th>FIPS</th><th>Type</th><th>Date range</th><th>Last heartbeat</th></tr>' + allRows + '</table>'
+    : '<div class="empty">No workers</div>';
 
   return '<div class="court">' +
     '<h2>' + name + '</h2>' +
     '<div class="stats">' +
-      '<div class="stat"><div class="n">' + c.active.length + '</div><div class="l">Active</div></div>' +
       '<div class="stat"><div class="n">' + c.pending_count + '</div><div class="l">Pending</div></div>' +
       '<div class="stat"><div class="n">' + c.completed_count + '</div><div class="l">Completed</div></div>' +
       '<div class="stat"><div class="n">' + c.dates_searched + '</div><div class="l">Dates done</div></div>' +
@@ -405,14 +449,13 @@ function renderCompleted(data) {
 
   var dCount = lastStatus ? lastStatus.courts.district.completed_count : 0;
   var cCount = lastStatus ? lastStatus.courts.circuit.completed_count : 0;
-  document.getElementById('grid-completed').innerHTML =
-    '<div class="court completed-box">' +
+  document.getElementById('completed-card').innerHTML =
     '<h2>Completed tasks</h2>' +
     '<div class="stats">' +
       '<div class="stat"><div class="n">' + data.total + '</div><div class="l">Total completed</div></div>' +
       '<div class="stat"><div class="n">' + dCount + '</div><div class="l">District</div></div>' +
       '<div class="stat"><div class="n">' + cCount + '</div><div class="l">Circuit</div></div>' +
-    '</div>' + doneTable + pager + '</div>';
+    '</div>' + doneTable + pager;
 }
 function loadCompleted() {
   fetch('/api/completed?page=' + completedPage)
