@@ -89,6 +89,8 @@ On every machine that should host collectors, run the supervisor:
 
 The supervisor polls the desired count and starts or stops local `court_bulk_collector.py` processes to match (capped at 10, since the court site becomes unstable past that). Collectors run without opening a window; each one's output is written to its own file under `worker_logs/`. To scale across servers, run one supervisor per machine - the desired count is shared through the database, and the dashboard's "running" figure reflects the actual collectors that have registered.
 
+The **Worker logs** button at the top opens a viewer for those `worker_logs/` files: pick a log on the left to see its tail on the right, refreshed live while open. Note that the dashboard reads the log directory on its own machine, so it shows logs for collectors running on that same host (in a multi-server setup, logs on other machines aren't visible here).
+
 ## How to generate person ids
 
 Many effective uses of this data require grouping criminal cases to defendant. Unfortunately, the state does not provide any unique identifier, so the [generate_person_ids.py](https://github.com/bschoenfeld/va-court-scraper/blob/master/generate_person_ids.py) script attempts to create one. The script takes all cases and breaks them into groups based on gender, day of birth (there are no years in the case data), and first letter of last name. For each group, every name is compared to every other name using a fuzzy string match. This process can take a while. The script is built so that it can be run in parallel, one execution for each month of the year. I recommend a beefy server - I use a t2.xlarge on AWS, which has 4 CPUs and 16 GB of memory.

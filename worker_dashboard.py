@@ -42,6 +42,8 @@ ensure_schema()
 
 # The court site becomes unstable past ~10 collectors, so cap the desired count.
 MAX_WORKERS = 10
+# Directory the supervisor writes per-worker logs to (relative to repo root).
+LOG_DIR = 'worker_logs'
 
 # Case tables are created by SQLAlchemy with mixed-case names. CASE_TABLE_NAMES
 # holds the raw name (for pg_class lookups); queries that hit the table directly
@@ -334,6 +336,54 @@ def set_worker_target():
     return jsonify({'ok': True, 'court_type': court_type, 'desired_count': desired})
 
 
+def _safe_log_path(name):
+    # Only allow plain *.log filenames inside LOG_DIR (no path traversal).
+    if not name or '/' in name or '\\' in name or '..' in name or not name.endswith('.log'):
+        return None
+    path = os.path.join(LOG_DIR, name)
+    return path if os.path.isfile(path) else None
+
+
+@app.route('/api/logs')
+def list_logs():
+    items = []
+    try:
+        for n in os.listdir(LOG_DIR):
+            if not n.endswith('.log'):
+                continue
+            try:
+                st = os.stat(os.path.join(LOG_DIR, n))
+                items.append({'name': n, 'size': st.st_size, 'modified': st.st_mtime})
+            except Exception:
+                pass
+    except Exception:
+        pass
+    items.sort(key=lambda x: x['modified'], reverse=True)
+    return jsonify({'logs': items})
+
+
+@app.route('/api/logs/view')
+def view_log():
+    path = _safe_log_path(request.args.get('name', ''))
+    if not path:
+        return jsonify({'ok': False, 'error': 'Log not found'}), 404
+    try:
+        tail = max(1, min(2000, int(request.args.get('tail', 400))))
+    except (TypeError, ValueError):
+        tail = 400
+    try:
+        # Read only the tail end of the file so large logs stay cheap.
+        with open(path, 'rb') as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 256 * 1024))
+            data = f.read().decode('utf-8', 'replace')
+        content = '\n'.join(data.splitlines()[-tail:])
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+    return jsonify({'ok': True, 'name': request.args.get('name', ''), 'content': content})
+
+
 @app.route('/')
 def index():
     return PAGE
@@ -347,6 +397,22 @@ PAGE = """<!DOCTYPE html>
 <style>
   body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; background: #0f1115; color: #e6e6e6; }
   h1 { font-size: 20px; margin: 0 0 4px; }
+  .top { display: flex; align-items: center; justify-content: space-between; }
+  .logs-btn { background: #21262d; color: #e6e6e6; border: 1px solid #30363d; border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 13px; }
+  .logs-btn:hover { background: #30363d; }
+  .modal { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: flex; align-items: center; justify-content: center; z-index: 50; }
+  .modal-box { background: #171a21; border: 1px solid #262b36; border-radius: 8px; width: 80%; max-width: 1000px; height: 80%; display: flex; flex-direction: column; }
+  .modal-head { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; border-bottom: 1px solid #262b36; }
+  .modal-head h2 { margin: 0; font-size: 16px; }
+  .modal-head button { background: none; border: none; color: #8a8f98; font-size: 22px; cursor: pointer; line-height: 1; }
+  .modal-body { display: flex; flex: 1; min-height: 0; }
+  .log-list { width: 280px; border-right: 1px solid #262b36; overflow-y: auto; }
+  .log-item { padding: 8px 12px; cursor: pointer; border-bottom: 1px solid #1f242c; }
+  .log-item:hover { background: #1f242c; }
+  .log-item.active { background: #21262d; }
+  .log-item .ln { font-size: 12px; color: #e6e6e6; word-break: break-all; }
+  .log-item .lm { font-size: 11px; color: #8a8f98; }
+  .log-view { flex: 1; margin: 0; padding: 12px; overflow: auto; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; white-space: pre-wrap; color: #cdd3dc; }
   .meta { color: #8a8f98; font-size: 13px; margin-bottom: 20px; }
   .grid { display: flex; gap: 24px; flex-wrap: wrap; }
   .court { flex: 1; min-width: 420px; background: #171a21; border: 1px solid #262b36; border-radius: 8px; padding: 16px; }
@@ -390,8 +456,23 @@ PAGE = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-  <h1>Virginia Court Scraper &mdash; Worker Dashboard</h1>
+  <div class="top">
+    <h1>Virginia Court Scraper &mdash; Worker Dashboard</h1>
+    <button class="logs-btn" onclick="openLogs()">Worker logs</button>
+  </div>
   <div class="meta" id="meta">Loading&hellip;</div>
+  <div class="modal" id="logs-modal" style="display:none;">
+    <div class="modal-box">
+      <div class="modal-head">
+        <h2>Worker logs</h2>
+        <button onclick="closeLogs()">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="log-list" id="log-list"></div>
+        <pre class="log-view" id="log-view">Select a log to view&hellip;</pre>
+      </div>
+    </div>
+  </div>
   <div class="grid" id="grid"></div>
   <div class="grid" id="grid-completed" style="margin-top:24px;">
     <div class="scheduler completed-box">
@@ -424,6 +505,48 @@ function fmtAgo(s) {
   if (s < 60) return s + 's ago';
   var m = Math.floor(s / 60);
   return m + 'm ' + (s % 60) + 's ago';
+}
+var currentLog = null;
+var logsTimer = null;
+function openLogs() {
+  document.getElementById('logs-modal').style.display = 'flex';
+  loadLogList();
+}
+function closeLogs() {
+  document.getElementById('logs-modal').style.display = 'none';
+  if (logsTimer) { clearTimeout(logsTimer); logsTimer = null; }
+  currentLog = null;
+}
+function loadLogList() {
+  fetch('/api/logs').then(function(r){ return r.json(); }).then(function(d){
+    var html = (d.logs || []).map(function(l){
+      var when = new Date(l.modified * 1000).toLocaleString();
+      var kb = (l.size / 1024).toFixed(1);
+      var active = (l.name === currentLog) ? ' active' : '';
+      return '<div class="log-item' + active + '" onclick="viewLog(&#39;' + l.name + '&#39;)">' +
+        '<div class="ln">' + l.name + '</div>' +
+        '<div class="lm">' + kb + ' KB · ' + when + '</div></div>';
+    }).join('');
+    document.getElementById('log-list').innerHTML = html || '<div class="empty">No logs yet</div>';
+  });
+}
+function viewLog(name) {
+  currentLog = name;
+  loadLogList();
+  refreshLogView();
+}
+function refreshLogView() {
+  if (!currentLog) return;
+  fetch('/api/logs/view?name=' + encodeURIComponent(currentLog) + '&tail=400')
+    .then(function(r){ return r.json(); }).then(function(d){
+      if (!d.ok) return;
+      var v = document.getElementById('log-view');
+      var atBottom = v.scrollTop + v.clientHeight >= v.scrollHeight - 20;
+      v.textContent = d.content || '(empty)';
+      if (atBottom) v.scrollTop = v.scrollHeight;
+    });
+  if (logsTimer) clearTimeout(logsTimer);
+  logsTimer = setTimeout(refreshLogView, 3000);
 }
 function setTarget(court, desired) {
   if (desired < 0) desired = 0;
