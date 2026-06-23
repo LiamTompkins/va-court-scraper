@@ -77,6 +77,8 @@ It automatically opens your browser to the dashboard and refreshes every second.
 
 The "Schedule tasks" form at the top creates collection tasks without the command line - the same as running `court_bulk_task_creator.py`. Choose a court level, case type, and a descending date range (start date on or after end date); leave FIPS blank to create a task for every court, or enter one to target a single court. Newly created tasks appear in the pending count and are picked up by any running collectors.
 
+The "Scheduled tasks" box lists the tasks currently queued (court, FIPS, case type, and date range), paginated newest-first. It updates live, so tasks disappear from the list as collectors claim them.
+
 The dashboard needs Flask, which is already listed in `requirements.txt`.
 
 ### Start workers from the dashboard

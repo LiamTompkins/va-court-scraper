@@ -264,6 +264,52 @@ def completed():
     })
 
 
+PENDING_PER_PAGE = 10
+
+
+@app.route('/api/pending')
+def pending():
+    try:
+        page = max(0, int(request.args.get('page', 0)))
+    except (TypeError, ValueError):
+        page = 0
+
+    rows = []
+    with engine.connect() as conn:
+        for court_type in ['district', 'circuit']:
+            table = '%s_court_date_tasks' % court_type
+            try:
+                result = conn.execute(text(
+                    'SELECT id, fips, casetype, startdate, enddate FROM %s' % table
+                ))
+                for r in result:
+                    rows.append({
+                        'court': court_type.capitalize(),
+                        'fips': str(r[1]).zfill(3),
+                        'case_type': r[2],
+                        'start_date': r[3].isoformat() if r[3] else None,
+                        'end_date': r[4].isoformat() if r[4] else None,
+                        '_id': r[0],
+                    })
+            except Exception:
+                pass
+
+    # No created-at column on tasks, so order by id (creation order), newest first.
+    rows.sort(key=lambda x: x['_id'], reverse=True)
+    total = len(rows)
+    start = page * PENDING_PER_PAGE
+    page_rows = rows[start:start + PENDING_PER_PAGE]
+    for r in page_rows:
+        del r['_id']
+
+    return jsonify({
+        'page': page,
+        'per_page': PENDING_PER_PAGE,
+        'total': total,
+        'tasks': page_rows,
+    })
+
+
 @app.route('/api/tasks/create', methods=['POST'])
 def create_tasks():
     data = request.get_json(force=True, silent=True) or {}
@@ -499,6 +545,9 @@ PAGE = """<!DOCTYPE html>
     </div>
     <div class="court completed-box" id="completed-card"></div>
   </div>
+  <div class="grid" id="grid-pending" style="margin-top:24px;">
+    <div class="court completed-box" id="pending-card"></div>
+  </div>
 <script>
 function fmtAgo(s) {
   if (s === null) return 'no heartbeat';
@@ -688,6 +737,54 @@ function changePage(delta) {
   completedPage = Math.max(0, completedPage + delta);
   loadCompleted();
 }
+var pendingPage = 0;
+function renderPending(data) {
+  var rows = data.tasks.map(function(t) {
+    return '<tr>' +
+      '<td>' + t.court + '</td>' +
+      '<td>' + t.fips + '</td>' +
+      '<td>' + t.case_type + '</td>' +
+      '<td>' + (t.start_date || '') + ' → ' + (t.end_date || '') + '</td>' +
+      '</tr>';
+  }).join('');
+  var tbl = data.tasks.length
+    ? '<table><tr><th>Court</th><th>FIPS</th><th>Type</th><th>Date range</th></tr>' + rows + '</table>'
+    : '<div class="empty">No scheduled tasks</div>';
+
+  var totalPages = Math.max(1, Math.ceil(data.total / data.per_page));
+  var page = data.page;
+  var pager = '<div class="pager">' +
+    '<button onclick="changePendingPage(-1)" ' + (page <= 0 ? 'disabled' : '') + '>&larr; Newer</button>' +
+    '<span>Page ' + (page + 1) + ' of ' + totalPages + '</span>' +
+    '<button onclick="changePendingPage(1)" ' + ((page + 1) >= totalPages ? 'disabled' : '') + '>Older &rarr;</button>' +
+    '</div>';
+
+  var dCount = lastStatus ? lastStatus.courts.district.pending_count : 0;
+  var cCount = lastStatus ? lastStatus.courts.circuit.pending_count : 0;
+  document.getElementById('pending-card').innerHTML =
+    '<h2>Scheduled tasks</h2>' +
+    '<div class="stats">' +
+      '<div class="stat"><div class="n">' + data.total + '</div><div class="l">Total pending</div></div>' +
+      '<div class="stat"><div class="n">' + dCount + '</div><div class="l">District</div></div>' +
+      '<div class="stat"><div class="n">' + cCount + '</div><div class="l">Circuit</div></div>' +
+    '</div>' + tbl + pager;
+}
+function loadPending() {
+  fetch('/api/pending?page=' + pendingPage)
+    .then(function(r){ return r.json(); })
+    .then(function(data){
+      var totalPages = Math.max(1, Math.ceil(data.total / data.per_page));
+      if (pendingPage > totalPages - 1) {
+        pendingPage = totalPages - 1;
+        return loadPending();
+      }
+      renderPending(data);
+    });
+}
+function changePendingPage(delta) {
+  pendingPage = Math.max(0, pendingPage + delta);
+  loadPending();
+}
 var ACTIVE_INTERVAL = 1000;
 var IDLE_INTERVAL = 10000;
 var refreshTimer = null;
@@ -704,6 +801,7 @@ function refresh() {
     document.getElementById('grid').innerHTML =
       courtCard('District', d.courts.district) + courtCard('Circuit', d.courts.circuit);
     loadCompleted();
+    loadPending();
     // Poll fast while any worker is active, slowly when everything is idle
     var anyActive = d.courts.district.active.length + d.courts.circuit.active.length > 0;
     var interval = anyActive ? ACTIVE_INTERVAL : IDLE_INTERVAL;
