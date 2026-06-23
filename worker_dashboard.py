@@ -647,7 +647,7 @@ function courtCard(name, c) {
       '<td><span class="dot ' + cls + '"></span>working</td>' +
       '<td>' + t.fips + '</td>' +
       '<td>' + t.case_type + '</td>' +
-      '<td>' + (t.start_date || '') + ' → ' + (t.end_date || '') + '</td>' +
+      '<td>' + (t.end_date || '') + ' → ' + (t.start_date || '') + '</td>' +
       '<td class="' + cls + '">' + fmtAgo(t.seconds_since) + '</td>' +
       '</tr>';
   }).join('');
@@ -690,7 +690,7 @@ function renderCompleted(data) {
       '<td>' + t.court + '</td>' +
       '<td>' + t.fips + '</td>' +
       '<td>' + t.case_type + '</td>' +
-      '<td>' + (t.start_date || '') + ' → ' + (t.end_date || '') + '</td>' +
+      '<td>' + (t.end_date || '') + ' → ' + (t.start_date || '') + '</td>' +
       '<td>' + fmtWhen(t.completed_at) + '</td>' +
       '</tr>';
   }).join('');
@@ -742,7 +742,7 @@ function renderPending(data) {
       '<td>' + t.court + '</td>' +
       '<td>' + t.fips + '</td>' +
       '<td>' + t.case_type + '</td>' +
-      '<td>' + (t.start_date || '') + ' → ' + (t.end_date || '') + '</td>' +
+      '<td>' + (t.end_date || '') + ' → ' + (t.start_date || '') + '</td>' +
       '</tr>';
   }).join('');
   var tbl = data.tasks.length
