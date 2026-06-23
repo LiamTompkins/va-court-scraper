@@ -520,33 +520,31 @@ PAGE = """<!DOCTYPE html>
     </div>
   </div>
   <div class="grid" id="grid"></div>
-  <div class="grid" id="grid-completed" style="margin-top:24px;">
-    <div class="scheduler completed-box">
-      <h2>Schedule tasks</h2>
-      <div class="row">
-        <label>Court level
-          <select id="sch-court"><option value="district">district</option><option value="circuit">circuit</option></select>
-        </label>
-        <label>Case type
-          <select id="sch-case"><option value="criminal">criminal</option><option value="civil">civil</option></select>
-        </label>
-        <label>Start (earliest)
-          <input type="date" id="sch-end">
-        </label>
-        <label>End (latest)
-          <input type="date" id="sch-start">
-        </label>
-        <label>FIPS (optional)
-          <input type="text" id="sch-fips" placeholder="all courts" size="10">
-        </label>
-        <button onclick="createTasks()">Create tasks</button>
-        <span class="msg" id="sch-msg"></span>
-      </div>
+  <div class="scheduler" style="margin-top:24px;">
+    <h2>Task Scheduler</h2>
+    <div class="row">
+      <label>Court level
+        <select id="sch-court"><option value="district">district</option><option value="circuit">circuit</option></select>
+      </label>
+      <label>Case type
+        <select id="sch-case"><option value="criminal">criminal</option><option value="civil">civil</option></select>
+      </label>
+      <label>Start (earliest)
+        <input type="date" id="sch-end">
+      </label>
+      <label>End (latest)
+        <input type="date" id="sch-start">
+      </label>
+      <label>FIPS (optional)
+        <input type="text" id="sch-fips" placeholder="all courts" size="10">
+      </label>
+      <button onclick="createTasks()">Create tasks</button>
+      <span class="msg" id="sch-msg"></span>
     </div>
-    <div class="court completed-box" id="completed-card"></div>
   </div>
-  <div class="grid" id="grid-pending" style="margin-top:24px;">
-    <div class="court completed-box" id="pending-card"></div>
+  <div class="grid" id="grid-completed" style="margin-top:24px;">
+    <div class="court" id="completed-card"></div>
+    <div class="court" id="pending-card"></div>
   </div>
 <script>
 function fmtAgo(s) {
