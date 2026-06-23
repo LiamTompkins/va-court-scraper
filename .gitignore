@@ -80,3 +80,4 @@ venv/
 chromedriver.exe
 
 worker_logs/
+worker_supervisor.lock
