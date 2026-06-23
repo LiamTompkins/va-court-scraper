@@ -17,6 +17,7 @@ from sqlalchemy import create_engine, text
 COURT_TYPES = ['district', 'circuit']
 POLL_SECONDS = 5
 MAX_WORKERS = 10  # the court site becomes unstable past ~10 collectors
+LOG_DIR = 'worker_logs'  # each collector's output goes to its own file here
 
 engine = create_engine('postgresql://' + os.environ['POSTGRES_DB'])
 
@@ -47,18 +48,38 @@ def get_desired(court_type):
 
 
 def reap(court_type):
-    children[court_type] = [p for p in children[court_type] if p.poll() is None]
+    alive = []
+    for p in children[court_type]:
+        if p.poll() is None:
+            alive.append(p)
+        else:
+            logf = getattr(p, '_logf', None)
+            if logf is not None:
+                try:
+                    logf.close()
+                except Exception:
+                    pass
+    children[court_type] = alive
 
 
 def start_worker(court_type):
-    kwargs = {}
+    if not os.path.isdir(LOG_DIR):
+        try:
+            os.makedirs(LOG_DIR)
+        except Exception:
+            pass
+    log_path = os.path.join(
+        LOG_DIR, '%s-%s.log' % (court_type, datetime.now().strftime('%Y%m%d-%H%M%S-%f')))
+    logf = open(log_path, 'a')
+    # Run windowless and send output to the log file instead of a new console.
+    kwargs = {'stdout': logf, 'stderr': subprocess.STDOUT}
     if os.name == 'nt':
-        # Give each collector its own console window so its logs stay visible.
-        kwargs['creationflags'] = subprocess.CREATE_NEW_CONSOLE
+        kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
     p = subprocess.Popen([sys.executable, 'court_bulk_collector.py', court_type], **kwargs)
+    p._logf = logf  # keep the file handle alive until the process is reaped
     children[court_type].append(p)
-    print('[%s] started %s collector pid=%d' % (
-        datetime.now().strftime('%H:%M:%S'), court_type, p.pid))
+    print('[%s] started %s collector pid=%d -> %s' % (
+        datetime.now().strftime('%H:%M:%S'), court_type, p.pid, log_path))
 
 
 def stop_worker(court_type):

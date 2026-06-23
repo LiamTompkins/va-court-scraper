@@ -78,3 +78,5 @@ chromedriver
 
 venv/
 chromedriver.exe
+
+worker_logs/
