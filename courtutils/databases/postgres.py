@@ -857,9 +857,19 @@ class PostgresDatabase():
                         .delete()
                     self.session.commit()
 
+                # Only claim a task whose court (fips + casetype) isn't already
+                # active. Otherwise a leftover active row (e.g. from a worker
+                # that was killed) would collide on the unique index and make
+                # this loop spin forever on the same task.
+                active_builder = self.active_date_task_builder
+                task_builder = self.date_task_builder
                 task = self.session \
-                           .query(self.date_task_builder) \
-                           .order_by(self.date_task_builder.startdate.desc()) \
+                           .query(task_builder) \
+                           .filter(~self.session.query(active_builder).filter(
+                               active_builder.fips == task_builder.fips,
+                               active_builder.casetype == task_builder.casetype
+                           ).exists()) \
+                           .order_by(task_builder.startdate.desc()) \
                            .first()
                 if task is None:
                     return None

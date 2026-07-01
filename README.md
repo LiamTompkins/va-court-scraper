@@ -67,6 +67,8 @@ Run it in a separate terminal alongside your collectors:
 
 Only one instance of the watchdog needs to run regardless of how many collectors you have. It is recommended to always run the watchdog when running collectors.
 
+**If you manage collectors with the supervisor (see below), you do not need the watchdog** - the supervisor already reclaims stale tasks on every poll cycle. Only run the watchdog when you start collectors manually (without the supervisor), and never run both at once, since two processes reclaiming stale tasks concurrently can create duplicate pending rows.
+
 ### Monitor workers with the dashboard
 
 The dashboard gives a live, browser-based view of what the collectors are doing, and lets you schedule new collection tasks. Start it in its own terminal:
@@ -90,6 +92,8 @@ On every machine that should host collectors, run the supervisor:
         python worker_supervisor.py
 
 The supervisor polls the desired count and starts or stops local `court_bulk_collector.py` processes to match (capped at 10, since the court site becomes unstable past that). Collectors run without opening a window; each one's output is written to its own file under `worker_logs/`. To scale across servers, run one supervisor per machine - the desired count is shared through the database, and the dashboard's "running" figure reflects the actual collectors that have registered.
+
+The supervisor also reclaims stale tasks each cycle (the same job as the watchdog), so when you run the supervisor you do not need to run `task_watchdog.py` as well.
 
 The **Worker logs** button at the top opens a viewer for those `worker_logs/` files: pick a log on the left to see its tail on the right, refreshed live while open. Note that the dashboard reads the log directory on its own machine, so it shows logs for collectors running on that same host (in a multi-server setup, logs on other machines aren't visible here).
 

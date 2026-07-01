@@ -6,7 +6,7 @@ import time
 import socket
 import atexit
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import create_engine, text
 
@@ -22,6 +22,7 @@ from sqlalchemy import create_engine, text
 COURT_TYPES = ['district', 'circuit']
 POLL_SECONDS = 5
 MAX_WORKERS = 10  # the court site becomes unstable past ~10 collectors
+STALE_TASK_SECONDS = 120  # active tasks with no heartbeat this long are reclaimed
 LOG_DIR = 'worker_logs'  # each collector's output goes to its own file here
 LOCK_FILE = 'worker_supervisor.lock'
 
@@ -129,6 +130,28 @@ def ensure_target_table():
         pass
 
 
+def reset_stale_tasks():
+    """Move active tasks whose heartbeat has gone stale (or was never set) back to
+    the pending queue, so a killed/crashed worker's court can be claimed again.
+    Runs from the single supervisor, so there's no concurrent-writer race."""
+    cutoff = datetime.now() - timedelta(seconds=STALE_TASK_SECONDS)
+    for court_type in COURT_TYPES:
+        active = '%s_court_active_date_tasks' % court_type
+        pending = '%s_court_date_tasks' % court_type
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(
+                    'INSERT INTO %s (fips, startdate, enddate, casetype) '
+                    'SELECT fips, startdate, enddate, casetype FROM %s '
+                    'WHERE last_alive IS NULL OR last_alive < :cutoff' % (pending, active)
+                ), {'cutoff': cutoff})
+                conn.execute(text(
+                    'DELETE FROM %s WHERE last_alive IS NULL OR last_alive < :cutoff' % active
+                ), {'cutoff': cutoff})
+        except Exception:
+            pass
+
+
 def get_desired(court_type):
     try:
         with engine.connect() as conn:
@@ -193,6 +216,7 @@ def main():
     clean_slate()
     print('Supervisor running on %s (poll every %ds)' % (socket.gethostname(), POLL_SECONDS))
     while True:
+        reset_stale_tasks()
         for court_type in COURT_TYPES:
             reap(court_type)
             desired = get_desired(court_type)
