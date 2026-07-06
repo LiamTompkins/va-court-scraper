@@ -36,6 +36,29 @@ def get_db_connection():
         return PostgresDatabase(COURT_TYPE)
     return None
 
+# Lightweight engine for cheap "is there work?" checks while idle, so we don't
+# rebuild a full PostgresDatabase (which re-checks the whole schema) every poll.
+_idle_engine = None
+
+def has_pending_work():
+    global _idle_engine
+    try:
+        if _idle_engine is None:
+            _idle_engine = create_engine('postgresql://' + os.environ['POSTGRES_DB'])
+        table = '%s_court_date_tasks' % COURT_TYPE
+        with _idle_engine.connect() as conn:
+            count = conn.execute(text('SELECT COUNT(*) FROM %s' % table)).scalar()
+        return (count or 0) > 0
+    except Exception:
+        # On any error, fall through to the normal (full) path.
+        if _idle_engine is not None:
+            try:
+                _idle_engine.dispose()
+            except Exception:
+                pass
+            _idle_engine = None
+        return True
+
 # Identify this collector process so the dashboard can show it even when idle.
 WORKER_ID = '%s-%d' % (socket.gethostname(), os.getpid())
 _worker_state = {'status': 'idle', 'fips': None, 'case_type': None}
@@ -98,53 +121,65 @@ def get_cases_on_date(db, reader, fips, case_type, date, dateStr):
     cases = reader.get_cases_by_date(fips, case_type, dateStr)
     total_cases = len(cases)
     for i, case in enumerate(cases, 1):
-        case['details_fetched_for_hearing_date'] = date
-        case['fips'] = fips
-        case['collected'] = datetime.datetime.now()
+        try:
+            case['details_fetched_for_hearing_date'] = date
+            case['fips'] = fips
+            case['collected'] = datetime.datetime.now()
 
-        # If the hearing is in the future, add to the docket table - don't get details
-        if date > datetime.datetime.now().date():
-            print('[%s] [%d/%d] Docket %s %s' % (fips, i, total_cases, case['case_number'], case['defendant']))
-            case['CaseNumber'] = case['case_number']
-            case['Defendant'] = case['defendant']
-            if case_type == 'civil':
-                case['CaseType'] = case['civil_case_type']
-                case['Plaintiff'] = case['plaintiff']
-            db.add_case_to_docket(case, case_type)
-            continue
-        
-        case_details = db.get_more_recent_case_details(case, case_type, date)
-        if case_details != None:
-            last_date = case_details['details_fetched_for_hearing_date'].strftime('%m/%d/%Y')
-            collected_date = case_details['collected'].strftime('%m/%d/%Y')
-            if case_details['details_fetched_for_hearing_date'] < case_details['collected']:
-                print('[%s] [%d/%d] %s details collected for hearing on %s' % (fips, i, total_cases, case['case_number'], last_date))
+            # If the hearing is in the future, add to the docket table - don't get details
+            if date > datetime.datetime.now().date():
+                print('[%s] [%d/%d] Docket %s %s' % (fips, i, total_cases, case['case_number'], case['defendant']))
+                case['CaseNumber'] = case['case_number']
+                case['Defendant'] = case['defendant']
+                if case_type == 'civil':
+                    case['CaseType'] = case['civil_case_type']
+                    case['Plaintiff'] = case['plaintiff']
+                db.add_case_to_docket(case, case_type)
                 continue
+
+            case_details = db.get_more_recent_case_details(case, case_type, date)
+            if case_details != None:
+                last_date = case_details['details_fetched_for_hearing_date'].strftime('%m/%d/%Y')
+                collected_date = case_details['collected'].strftime('%m/%d/%Y')
+                if case_details['details_fetched_for_hearing_date'] < case_details['collected']:
+                    print('[%s] [%d/%d] %s details collected for hearing on %s' % (fips, i, total_cases, case['case_number'], last_date))
+                    continue
+                else:
+                    print('[%s] [%d/%d] %s details were collected on %s before hearing date on %s - updating now' % (fips, i, total_cases, case['case_number'], collected_date, last_date))
+            if '--' in case['case_number']:
+                if case_type == 'civil':
+                    case['details'] = {
+                        'CaseNumber': case['case_number']
+                    }
+                elif 'defendant' in case:
+                    case['details'] = {
+                        'CaseNumber': case['case_number'],
+                        'Defendant': case['defendant']
+                    }
             else:
-                print('[%s] [%d/%d] %s details were collected on %s before hearing date on %s - updating now' % (fips, i, total_cases, case['case_number'], collected_date, last_date))
-        if '--' in case['case_number']:
-            if case_type == 'civil':
-                case['details'] = {
-                    'CaseNumber': case['case_number']
-                }
-            elif 'defendant' in case:
-                case['details'] = {
-                    'CaseNumber': case['case_number'],
-                    'Defendant': case['defendant']
-                }
-        else:
-            if len(case['case_number']) < 13:
-                print('[%s] is an invalid case number' % (case['case_number'],))
-                continue
-            case['details'] = reader.get_case_details_by_number(
-                fips, case_type, case['case_number'],
-                case['details_url'] if 'details_url' in case else None)
-        if 'error' in case['details']:
-            print('Could not collect case details for %s in %s' % (
-                     case['case_number'], case['fips']))
-        else:
-            print('[%s] [%d/%d] %s %s' % (fips, i, total_cases, case['case_number'], case['defendant']))
-            db.replace_case_details(case, case_type)
+                if len(case['case_number']) < 13:
+                    print('[%s] is an invalid case number' % (case['case_number'],))
+                    continue
+                case['details'] = reader.get_case_details_by_number(
+                    fips, case_type, case['case_number'],
+                    case['details_url'] if 'details_url' in case else None)
+            if 'error' in case['details']:
+                print('Could not collect case details for %s in %s' % (
+                         case['case_number'], case['fips']))
+            else:
+                print('[%s] [%d/%d] %s %s' % (fips, i, total_cases, case['case_number'], case['defendant']))
+                db.replace_case_details(case, case_type)
+        except Exception as err:
+            # Let timeouts bubble up so the whole date is retried later; skip a
+            # single problematic case rather than abandoning the entire task.
+            if isinstance(err, socket.timeout) or 'timeout' in str(err).lower() or 'read operation' in str(err).lower():
+                raise
+            print('Error collecting case %s in %s: %s. Skipping case.' % (
+                case.get('case_number', '?'), fips, err))
+            try:
+                db.rollback()
+            except Exception:
+                pass
 
 def start_heartbeat(task, interval=30):
     stop_event = threading.Event()
@@ -186,6 +221,14 @@ def start_heartbeat(task, interval=30):
     return stop_event
 
 def run_collector(reader, last_task):
+    # Cheap idle check: with no finished task to clean up and no pending work,
+    # skip building a full PostgresDatabase and just wait.
+    if last_task is None and not has_pending_work():
+        set_worker_state('idle')
+        print('Nothing to do. Sleeping for 30 seconds.')
+        sleep(30)
+        return None
+
     db = get_db_connection()
 
     task = db.get_and_delete_date_task(last_task)
@@ -300,6 +343,10 @@ def run():
             finished_task = run_collector(reader, finished_task)
         except Exception as err:
             set_worker_state('idle')
+            # The failed task was already put back inside run_collector, so don't
+            # carry it forward as "finished" - reusing it would delete whatever
+            # active row now holds that court (possibly another worker's claim).
+            finished_task = None
             try:
                 reader.log_off()
             except:
@@ -310,6 +357,6 @@ def run():
                 print('Network timeout occurred. Sleeping for 30 seconds before retrying...')
                 sleep(30)
             else:
-                print('Unexpect error. Sleeping for 10 minute')
-                sleep(600)
+                print('Unexpected error. Sleeping for 60 seconds.')
+                sleep(60)
 run()
