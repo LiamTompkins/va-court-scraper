@@ -14,6 +14,21 @@ from pprint import pprint
 
 Base = declarative_base()
 
+
+def only_columns(model, details):
+    """Keep only keys that map to a column on ``model``, dropping (and warning
+    about) any others. The source websites occasionally add new fields; without
+    this a new field would raise TypeError and crash the collector."""
+    valid = set(c.key for c in model.__table__.columns)
+    filtered = {}
+    for key, value in details.items():
+        if key in valid:
+            filtered[key] = value
+        else:
+            print('WARNING: dropping unknown field %r for %s' % (key, model.__name__))
+    return filtered
+
+
 class Court():
     id = Column(Integer, primary_key=True)
     name = Column(String)
@@ -197,7 +212,7 @@ class CircuitCriminalCase(Base, Case):
             services = details['Services']
             del details['Services']
 
-        db_case = CircuitCriminalCase(**details)
+        db_case = CircuitCriminalCase(**only_columns(CircuitCriminalCase, details))
         db_case.fips = int(case['fips'])
         db_case.details_fetched_for_hearing_date = case['details_fetched_for_hearing_date']
         db_case.collected = case['collected']
@@ -271,7 +286,7 @@ class CircuitCivilCase(Base, Case):
             defendants = details['Defendants']
             del details['Defendants']
 
-        db_case = CircuitCivilCase(**details)
+        db_case = CircuitCivilCase(**only_columns(CircuitCivilCase, details))
         db_case.fips = int(case['fips'])
         db_case.details_fetched_for_hearing_date = case['details_fetched_for_hearing_date']
         db_case.collected = case['collected']
@@ -361,7 +376,7 @@ class DistrictCriminalCase(Base, Case):
             services = details['Services']
             del details['Services']
 
-        db_case = DistrictCriminalCase(**details)
+        db_case = DistrictCriminalCase(**only_columns(DistrictCriminalCase, details))
         db_case.fips = int(case['fips'])
         db_case.details_fetched_for_hearing_date = case['details_fetched_for_hearing_date']
         db_case.collected = case['collected']
@@ -440,7 +455,7 @@ class DistrictCivilCase(Base, Case):
             defendants = details['Defendants']
             del details['Defendants']
 
-        db_case = DistrictCivilCase(**details)
+        db_case = DistrictCivilCase(**only_columns(DistrictCivilCase, details))
         db_case.fips = int(case['fips'])
         db_case.details_fetched_for_hearing_date = case['details_fetched_for_hearing_date']
         db_case.collected = case['collected']
