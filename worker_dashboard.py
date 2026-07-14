@@ -317,7 +317,14 @@ def create_tasks():
     case_type = (data.get('case_type') or '').strip()
     start_s = (data.get('start_date') or '').strip()
     end_s = (data.get('end_date') or '').strip()
-    fips = (data.get('fips') or '').strip()
+    # fips may be a single value or a list of selected courts; empty means all.
+    fips_raw = data.get('fips')
+    if isinstance(fips_raw, list):
+        selected = [str(f).strip() for f in fips_raw if str(f).strip()]
+    elif fips_raw:
+        selected = [str(fips_raw).strip()]
+    else:
+        selected = []
 
     if court_type not in ('circuit', 'district'):
         return jsonify({'ok': False, 'error': 'Invalid court level'}), 400
@@ -333,17 +340,16 @@ def create_tasks():
     # most-recent date (start_date) must not precede the earliest (end_date).
     if start_date < end_date:
         return jsonify({'ok': False, 'error': 'Start date must be on or before end date'}), 400
-    if fips:
-        try:
-            fips_list = [int(fips)]
-        except ValueError:
-            return jsonify({'ok': False, 'error': 'FIPS must be numeric'}), 400
+    try:
+        fips_list = [int(f) for f in selected]
+    except ValueError:
+        return jsonify({'ok': False, 'error': 'FIPS must be numeric'}), 400
 
     courts_table = '%s_courts' % court_type
     tasks_table = '%s_court_date_tasks' % court_type
     try:
         with engine.begin() as conn:
-            if not fips:
+            if not fips_list:
                 fips_list = [r[0] for r in conn.execute(text('SELECT fips FROM %s' % courts_table))]
             if not fips_list:
                 return jsonify({'ok': False, 'error': 'No courts found - load courts first'}), 400
@@ -430,6 +436,22 @@ def view_log():
     return jsonify({'ok': True, 'name': request.args.get('name', ''), 'content': content})
 
 
+@app.route('/api/courts')
+def list_courts():
+    court_type = (request.args.get('court_type') or '').strip()
+    if court_type not in ('circuit', 'district'):
+        return jsonify({'courts': []})
+    courts = []
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text('SELECT fips, name FROM %s_courts ORDER BY name' % court_type))
+            for r in rows:
+                courts.append({'fips': str(r[0]).zfill(3), 'name': r[1]})
+    except Exception:
+        pass
+    return jsonify({'courts': courts})
+
+
 @app.route('/')
 def index():
     return PAGE
@@ -471,6 +493,16 @@ PAGE = """<!DOCTYPE html>
   .scheduler button { background: #238636; color: #fff; border: 1px solid #2ea043; border-radius: 6px; padding: 7px 16px; cursor: pointer; font-size: 13px; }
   .scheduler button:hover { background: #2ea043; }
   .scheduler .msg { margin-left: 8px; font-size: 13px; color: #8a8f98; }
+  .dropdown { position: relative; }
+  .scheduler .dd-toggle { background: #0f1115; color: #e6e6e6; border: 1px solid #30363d; border-radius: 6px; padding: 6px 8px; font-size: 13px; cursor: pointer; text-align: left; min-width: 130px; }
+  .scheduler .dd-toggle:hover { background: #0f1115; }
+  .scheduler .dd-toggle::after { content: ' ▾'; color: #8a8f98; }
+  .dd-panel { position: absolute; top: 100%; left: 0; margin-top: 4px; display: none; z-index: 20; box-shadow: 0 4px 16px rgba(0,0,0,.4); }
+  .dd-panel.open { display: block; }
+  .court-checks { max-height: 200px; overflow-y: auto; border: 1px solid #30363d; border-radius: 6px; padding: 6px 8px; background: #171a21; min-width: 240px; }
+  .court-checks label { display: flex; flex-direction: row; align-items: center; gap: 6px; font-size: 13px; text-transform: none; letter-spacing: normal; color: #e6e6e6; padding: 1px 0; white-space: nowrap; }
+  .court-checks input { margin: 0; }
+  .court-checks .empty { font-size: 13px; }
   .court h2 { font-size: 16px; margin: 0 0 12px; text-transform: capitalize; }
   .court-head { display: flex; align-items: center; justify-content: space-between; }
   .court-head h2 { margin: 0 0 12px; }
@@ -524,7 +556,7 @@ PAGE = """<!DOCTYPE html>
     <h2>Task Scheduler</h2>
     <div class="row">
       <label>Court level
-        <select id="sch-court"><option value="district">district</option><option value="circuit">circuit</option></select>
+        <select id="sch-court" onchange="loadCourts()"><option value="district">district</option><option value="circuit">circuit</option></select>
       </label>
       <label>Case type
         <select id="sch-case"><option value="criminal">criminal</option><option value="civil">civil</option></select>
@@ -535,8 +567,11 @@ PAGE = """<!DOCTYPE html>
       <label>End (latest)
         <input type="date" id="sch-start">
       </label>
-      <label>FIPS (optional)
-        <input type="text" id="sch-fips" placeholder="all courts" size="10">
+      <label>Courts (none = all)
+        <div class="dropdown">
+          <button type="button" class="dd-toggle" id="sch-courts-toggle" onclick="toggleCourts(event)">All courts</button>
+          <div class="dd-panel court-checks" id="sch-courts"></div>
+        </div>
       </label>
       <button onclick="createTasks()">Create tasks</button>
       <span class="msg" id="sch-msg"></span>
@@ -603,14 +638,46 @@ function setTarget(court, desired) {
     body: JSON.stringify({court_type: court, desired_count: desired})
   }).then(function(r){ return r.json(); }).then(function(d){ if (d.ok) refresh(); });
 }
+function toggleCourts(e) {
+  e.stopPropagation();
+  document.getElementById('sch-courts').classList.toggle('open');
+}
+function updateCourtsLabel() {
+  var n = document.querySelectorAll('#sch-courts input:checked').length;
+  document.getElementById('sch-courts-toggle').textContent = n === 0 ? 'All courts' : (n + ' selected');
+}
+function loadCourts() {
+  var court = document.getElementById('sch-court').value;
+  var box = document.getElementById('sch-courts');
+  fetch('/api/courts?court_type=' + court).then(function(r){ return r.json(); }).then(function(d){
+    var rows = (d.courts || []).map(function(c){
+      return '<label><input type="checkbox" value="' + c.fips + '"> ' + c.name + ' (' + c.fips + ')</label>';
+    }).join('');
+    box.innerHTML = rows || '<span class="empty">No courts loaded</span>';
+    Array.prototype.forEach.call(box.querySelectorAll('input[type=checkbox]'), function(cb){
+      cb.addEventListener('change', updateCourtsLabel);
+    });
+    updateCourtsLabel();
+  });
+}
+// Close the courts dropdown when clicking outside it.
+document.addEventListener('click', function(e){
+  var panel = document.getElementById('sch-courts');
+  var toggle = document.getElementById('sch-courts-toggle');
+  if (panel && !panel.contains(e.target) && e.target !== toggle) {
+    panel.classList.remove('open');
+  }
+});
 function createTasks() {
   var msg = document.getElementById('sch-msg');
+  var checked = document.querySelectorAll('#sch-courts input:checked');
+  var fips = Array.prototype.map.call(checked, function(c){ return c.value; });
   var body = {
     court_type: document.getElementById('sch-court').value,
     case_type: document.getElementById('sch-case').value,
     start_date: document.getElementById('sch-start').value,
     end_date: document.getElementById('sch-end').value,
-    fips: document.getElementById('sch-fips').value
+    fips: fips
   };
   if (!body.start_date || !body.end_date) { msg.textContent = 'Pick start and end dates.'; return; }
   msg.textContent = 'Creating…';
@@ -813,6 +880,7 @@ function refresh() {
     scheduleNext(IDLE_INTERVAL);
   });
 }
+loadCourts();
 refresh();
 </script>
 </body>
