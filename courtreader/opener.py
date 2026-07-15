@@ -30,6 +30,41 @@ class Opener:
     def save_cookies(self):
         return
 
+    def can_prompt(self):
+        """True only when running interactively (a real terminal), so unattended
+        collectors never block waiting on a browser/keyboard."""
+        import sys
+        try:
+            return bool(sys.stdin) and sys.stdin.isatty()
+        except Exception:
+            return False
+
+    def solve_with_browser(self, url):
+        """Open a real browser at ``url`` so the user can accept terms / solve a
+        CAPTCHA, then copy the resulting cookies into this opener."""
+        from selenium import webdriver
+        from six.moves import input
+        try:
+            driver = webdriver.Chrome()
+        except Exception as e:
+            print('Could not open a browser (%s). Make sure Chrome and a matching '
+                  'chromedriver are available.' % e)
+            raise
+        try:
+            driver.get(url)
+            input('A browser has opened. Accept any terms / solve the CAPTCHA there, '
+                  'then press Enter here to continue...')
+            for cookie in driver.get_cookies():
+                try:
+                    self.set_cookie(cookie['name'], cookie['value'])
+                except Exception:
+                    pass
+        finally:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
     def open(self, *args):
         import time
         import socket
@@ -62,6 +97,10 @@ class Opener:
                 # timeouts) instead of letting one bubble up and cost the whole
                 # task a 10-minute back-off. Only give up after max_attempts.
                 msg = str(e).lower()
+                # HTTP status errors (403, 404, 5xx) won't be fixed by retrying.
+                code = getattr(e, 'code', None)
+                if (isinstance(code, int) and code >= 400) or 'http error 4' in msg or 'http error 5' in msg:
+                    raise
                 transient = (
                     isinstance(e, (socket.timeout, socket.error, URLError, ConnectionError))
                     or 'timeout' in msg
