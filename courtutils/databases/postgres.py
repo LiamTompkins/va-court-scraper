@@ -6,6 +6,7 @@ from sqlalchemy import (create_engine, Boolean, Column,
                         Date, DateTime, Integer, BigInteger,
                         Float, String, ForeignKey, Index, and_, or_)
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm.exc import StaleDataError
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy.pool import NullPool
@@ -860,6 +861,16 @@ class PostgresDatabase():
     def record_retrieved_case(self, batch_id, case_type, fips, case_number):
         if batch_id is None:
             return
+        # A retried task re-processes dates it didn't finish, re-collecting
+        # cases already recorded for this batch - don't log them twice. (No
+        # insert race: a court is only ever claimed by one worker at a time.)
+        already = self.session.query(RetrievedCase.id).filter_by(
+            batch_id=batch_id,
+            fips=int(fips),
+            case_number=case_number
+        ).first()
+        if already is not None:
+            return
         self.session.add(
             RetrievedCase(
                 batch_id=batch_id,
@@ -961,29 +972,39 @@ class PostgresDatabase():
                            .first()
                 if task is None:
                     return None
+                # Claim atomically: delete the pending row and insert the active
+                # row in ONE transaction. With separate commits, losing a claim
+                # race (unique-index collision on the active table) rolled back
+                # only the insert - the already-committed delete left the task
+                # permanently lost.
+                claimed = {
+                    'fips': task.fips,
+                    'startdate': task.startdate,
+                    'enddate': task.enddate,
+                    'casetype': task.casetype,
+                    'batch_id': task.batch_id,
+                }
                 self.session.delete(task)
-                self.session.commit()
-
                 self.session.add(
                     self.active_date_task_builder(
-                        fips=task.fips,
-                        startdate=task.startdate,
-                        enddate=task.enddate,
-                        casetype=task.casetype,
                         last_alive=datetime.now(),
-                        batch_id=task.batch_id
+                        **claimed
                     )
                 )
                 self.session.commit()
+                task = claimed
 
                 return {
-                    'fips': str(task.fips).zfill(3),
-                    'start_date': task.startdate,
-                    'end_date': task.enddate,
-                    'case_type': task.casetype,
-                    'batch_id': task.batch_id
+                    'fips': str(claimed['fips']).zfill(3),
+                    'start_date': claimed['startdate'],
+                    'end_date': claimed['enddate'],
+                    'case_type': claimed['casetype'],
+                    'batch_id': claimed['batch_id']
                 }
-            except IntegrityError:
+            except (IntegrityError, StaleDataError):
+                # IntegrityError: lost the unique-index race on the active
+                # table. StaleDataError: another worker deleted the same pending
+                # row first. Either way the rollback restores our state; retry.
                 print('WARNING - FAILED TO GET NEW TASK')
                 self.session.rollback()
 

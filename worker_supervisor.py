@@ -140,9 +140,11 @@ def reset_stale_tasks():
         pending = '%s_court_date_tasks' % court_type
         try:
             with engine.begin() as conn:
+                # Carry batch_id along, or a reclaimed task loses its link to the
+                # batch that created it (its cases would stop being recorded).
                 conn.execute(text(
-                    'INSERT INTO %s (fips, startdate, enddate, casetype) '
-                    'SELECT fips, startdate, enddate, casetype FROM %s '
+                    'INSERT INTO %s (fips, startdate, enddate, casetype, batch_id) '
+                    'SELECT fips, startdate, enddate, casetype, batch_id FROM %s '
                     'WHERE last_alive IS NULL OR last_alive < :cutoff' % (pending, active)
                 ), {'cutoff': cutoff})
                 conn.execute(text(
