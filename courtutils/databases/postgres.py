@@ -6,6 +6,7 @@ from sqlalchemy import (create_engine, Boolean, Column,
                         Date, DateTime, Integer, BigInteger,
                         Float, String, ForeignKey, Index, and_, or_)
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm.exc import StaleDataError
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship
 from sqlalchemy.pool import NullPool
@@ -888,27 +889,36 @@ class PostgresDatabase():
                            .first()
                 if task is None:
                     return None
+                # Claim atomically: delete the pending row and insert the active
+                # row in ONE transaction. With separate commits, losing a claim
+                # race (unique-index collision on the active table) rolled back
+                # only the insert - the already-committed delete left the task
+                # permanently lost.
+                claimed = {
+                    'fips': task.fips,
+                    'startdate': task.startdate,
+                    'enddate': task.enddate,
+                    'casetype': task.casetype,
+                }
                 self.session.delete(task)
-                self.session.commit()
-
                 self.session.add(
                     self.active_date_task_builder(
-                        fips=task.fips,
-                        startdate=task.startdate,
-                        enddate=task.enddate,
-                        casetype=task.casetype,
-                        last_alive=datetime.now()
+                        last_alive=datetime.now(),
+                        **claimed
                     )
                 )
                 self.session.commit()
 
                 return {
-                    'fips': str(task.fips).zfill(3),
-                    'start_date': task.startdate,
-                    'end_date': task.enddate,
-                    'case_type': task.casetype
+                    'fips': str(claimed['fips']).zfill(3),
+                    'start_date': claimed['startdate'],
+                    'end_date': claimed['enddate'],
+                    'case_type': claimed['casetype']
                 }
-            except IntegrityError:
+            except (IntegrityError, StaleDataError):
+                # IntegrityError: lost the unique-index race on the active
+                # table. StaleDataError: another worker deleted the same pending
+                # row first. Either way the rollback restores our state; retry.
                 print('WARNING - FAILED TO GET NEW TASK')
                 self.session.rollback()
 
