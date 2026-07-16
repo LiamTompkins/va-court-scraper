@@ -191,7 +191,10 @@ def start_worker(court_type):
     kwargs = {'stdout': logf, 'stderr': subprocess.STDOUT}
     if os.name == 'nt':
         kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
-    p = subprocess.Popen([sys.executable, 'court_bulk_collector.py', court_type], **kwargs)
+    # -u keeps stdout unbuffered: writing to a log file (rather than a console)
+    # makes Python block-buffer, so output would only land in the log when the
+    # buffer filled or the process exited.
+    p = subprocess.Popen([sys.executable, '-u', 'court_bulk_collector.py', court_type], **kwargs)
     p._logf = logf  # keep the file handle alive until the process is reaped
     children[court_type].append(p)
     print('[%s] started %s collector pid=%d -> %s' % (
