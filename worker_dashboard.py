@@ -1,11 +1,14 @@
 from __future__ import absolute_import
 from __future__ import print_function
 import os
+import io
+import re
+import csv
 import threading
 import webbrowser
 from datetime import datetime, timedelta
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response
 from sqlalchemy import create_engine, text
 
 # Seconds without a heartbeat before an active task is considered stale.
@@ -29,6 +32,12 @@ def ensure_schema():
         ' fips INTEGER, case_type VARCHAR, last_alive TIMESTAMP)',
         'CREATE TABLE IF NOT EXISTS worker_targets ('
         ' court_type VARCHAR PRIMARY KEY, desired_count INTEGER, updated_at TIMESTAMP)',
+        'CREATE TABLE IF NOT EXISTS task_batches ('
+        ' id SERIAL PRIMARY KEY, name VARCHAR, created_at TIMESTAMP, court_type VARCHAR,'
+        ' case_type VARCHAR, startdate DATE, enddate DATE)',
+        'CREATE TABLE IF NOT EXISTS retrieved_cases ('
+        ' id BIGSERIAL PRIMARY KEY, batch_id INTEGER, court_type VARCHAR,'
+        ' case_type VARCHAR, fips INTEGER, case_number VARCHAR, collected_at TIMESTAMP)',
     ]
     try:
         with engine.begin() as conn:
@@ -36,6 +45,40 @@ def ensure_schema():
                 conn.execute(text(stmt))
     except Exception:
         pass
+    # Add batch_id to any existing task tables (each in its own transaction so a
+    # failure on a missing table doesn't abort the rest).
+    for t in ['circuit_court_date_tasks', 'district_court_date_tasks',
+              'circuit_court_active_date_tasks', 'district_court_active_date_tasks',
+              'circuit_court_completed_date_tasks', 'district_court_completed_date_tasks']:
+        try:
+            with engine.begin() as conn:
+                has_table = conn.execute(text(
+                    "SELECT 1 FROM information_schema.tables WHERE table_name = :t"
+                ), {'t': t}).scalar()
+                if not has_table:
+                    continue
+                has_col = conn.execute(text(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_name = :t AND column_name = 'batch_id'"
+                ), {'t': t}).scalar()
+                if not has_col:
+                    conn.execute(text('ALTER TABLE %s ADD COLUMN batch_id INTEGER' % t))
+        except Exception:
+            pass
+    # Add columns that may predate their introduction on existing tables.
+    for table, column, coltype in [
+        ('task_batches', 'name', 'VARCHAR'),
+    ]:
+        try:
+            with engine.begin() as conn:
+                has_col = conn.execute(text(
+                    "SELECT 1 FROM information_schema.columns "
+                    "WHERE table_name = :t AND column_name = :c"
+                ), {'t': table, 'c': column}).scalar()
+                if not has_col:
+                    conn.execute(text('ALTER TABLE %s ADD COLUMN %s %s' % (table, column, coltype)))
+        except Exception:
+            pass
 
 
 ensure_schema()
@@ -51,6 +94,34 @@ LOG_DIR = 'worker_logs'
 CASE_TABLE_NAMES = {
     'circuit': {'criminal': 'CircuitCriminalCase', 'civil': 'CircuitCivilCase'},
     'district': {'criminal': 'DistrictCriminalCase', 'civil': 'DistrictCivilCase'},
+}
+
+# Where to read each displayed field from, per court + case type. Column names
+# differ between the four case tables, and civil parties live in their own
+# tables, so the Collected Data view maps them here and joins live.
+CASE_SOURCES = {
+    ('district', 'criminal'): {
+        'table': 'DistrictCriminalCase',
+        'subtype': 'CaseType', 'judgement': 'FinalDisposition', 'date': 'FiledDate',
+        'defendant': 'Name', 'defendant_attorney': 'DefenseAttorney',
+        'parties': None,
+    },
+    ('circuit', 'criminal'): {
+        'table': 'CircuitCriminalCase',
+        'subtype': 'ChargeType', 'judgement': 'DispositionCode', 'date': 'Filed',
+        'defendant': 'Defendant', 'defendant_attorney': 'DefendantsAttorney',
+        'parties': None,
+    },
+    ('district', 'civil'): {
+        'table': 'DistrictCivilCase',
+        'subtype': 'CaseType', 'judgement': 'Judgment', 'date': 'FiledDate',
+        'parties': ('DistrictCivilPlaintiff', 'DistrictCivilDefendant'),
+    },
+    ('circuit', 'civil'): {
+        'table': 'CircuitCivilCase',
+        'subtype': 'FilingType', 'judgement': 'Judgment', 'date': 'Filed',
+        'parties': ('CircuitCivilPlaintiff', 'CircuitCivilDefendant'),
+    },
 }
 
 # Cache of exact case counts, keyed by (court_type, case_type). Only used while a
@@ -315,6 +386,7 @@ def create_tasks():
     data = request.get_json(force=True, silent=True) or {}
     court_type = (data.get('court_type') or '').strip()
     case_type = (data.get('case_type') or '').strip()
+    name = (data.get('name') or '').strip() or None
     start_s = (data.get('start_date') or '').strip()
     end_s = (data.get('end_date') or '').strip()
     # fips may be a single value or a list of selected courts; empty means all.
@@ -353,15 +425,21 @@ def create_tasks():
                 fips_list = [r[0] for r in conn.execute(text('SELECT fips FROM %s' % courts_table))]
             if not fips_list:
                 return jsonify({'ok': False, 'error': 'No courts found - load courts first'}), 400
+            batch_id = conn.execute(
+                text('INSERT INTO task_batches (name, created_at, court_type, case_type, startdate, enddate) '
+                     'VALUES (:nm, :now, :ct, :cs, :sd, :ed) RETURNING id'),
+                {'nm': name, 'now': datetime.now(), 'ct': court_type, 'cs': case_type,
+                 'sd': start_date, 'ed': end_date}
+            ).scalar()
             for f in fips_list:
                 conn.execute(
-                    text('INSERT INTO %s (fips, startdate, enddate, casetype) '
-                         'VALUES (:fips, :sd, :ed, :ct)' % tasks_table),
-                    {'fips': int(f), 'sd': start_date, 'ed': end_date, 'ct': case_type}
+                    text('INSERT INTO %s (fips, startdate, enddate, casetype, batch_id) '
+                         'VALUES (:fips, :sd, :ed, :ct, :bid)' % tasks_table),
+                    {'fips': int(f), 'sd': start_date, 'ed': end_date, 'ct': case_type, 'bid': batch_id}
                 )
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
-    return jsonify({'ok': True, 'created': len(fips_list)})
+    return jsonify({'ok': True, 'created': len(fips_list), 'batch_id': batch_id})
 
 
 @app.route('/api/workers/target', methods=['POST'])
@@ -452,9 +530,245 @@ def list_courts():
     return jsonify({'courts': courts})
 
 
+BATCH_CASES_PER_PAGE = 50
+# Columns the Collected Data table can be sorted by. Whitelisted because the
+# name is interpolated into the ORDER BY; they match the select-list aliases.
+SORTABLE_CASE_COLUMNS = {
+    'case_id', 'case_number', 'case_type', 'case_subtype', 'judgement',
+    'fips', 'case_date', 'plaintiff', 'plaintiff_attorney',
+    'defendant', 'defendant_attorney',
+}
+
+
+@app.route('/api/batches')
+def list_batches():
+    batches = []
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(text(
+                'SELECT b.id, b.name, b.court_type, b.case_type, b.startdate, b.enddate, b.created_at, '
+                '(SELECT COUNT(*) FROM retrieved_cases rc WHERE rc.batch_id = b.id) '
+                'FROM task_batches b ORDER BY b.created_at DESC NULLS LAST, b.id DESC'
+            ))
+            for r in rows:
+                batches.append({
+                    'id': r[0],
+                    'name': r[1],
+                    'court_type': r[2],
+                    'case_type': r[3],
+                    'start_date': r[4].isoformat() if r[4] else None,
+                    'end_date': r[5].isoformat() if r[5] else None,
+                    'created_at': r[6].isoformat() if r[6] else None,
+                    'cases': r[7] or 0,
+                })
+    except Exception:
+        pass
+    return jsonify({'batches': batches})
+
+
+CASE_EXPORT_COLUMNS = [
+    ('case_id', 'Case id'), ('case_number', 'Case number'), ('case_type', 'Category'),
+    ('case_subtype', 'Case type'), ('judgement', 'Judgement'), ('fips', 'FIPS'),
+    ('case_date', 'Case date'), ('plaintiff', 'Plaintiff'),
+    ('plaintiff_attorney', 'Plaintiff attorney'), ('defendant', 'Defendant'),
+    ('defendant_attorney', 'Defendant attorney'),
+]
+
+
+def fetch_batch_cases(conn, batch_id, sort=None, direction='ASC', limit=None, offset=0):
+    """Rows for a batch, joined live to the matching case table. Shared by the
+    paginated view and the CSV export so they can't drift apart. limit=None
+    returns every case in the batch."""
+    batch = conn.execute(text(
+        'SELECT court_type, case_type FROM task_batches WHERE id = :b'
+    ), {'b': batch_id}).first()
+    src = CASE_SOURCES.get((batch[0], batch[1])) if batch else None
+
+    params = {'b': batch_id}
+    if limit is not None:
+        params['lim'] = limit
+        params['off'] = offset
+    tail = ' LIMIT :lim OFFSET :off' if limit is not None else ''
+
+    if src is None:
+        # Unknown court/case type - fall back to the link-table fields only.
+        rows = conn.execute(text(
+            'SELECT case_number, fips, case_type FROM retrieved_cases '
+            'WHERE batch_id = :b ORDER BY collected_at DESC NULLS LAST, id DESC' + tail
+        ), params)
+        return [{'case_number': r[0], 'fips': str(r[1]).zfill(3), 'case_type': r[2],
+                 'case_id': None, 'case_subtype': None, 'judgement': None,
+                 'case_date': None, 'plaintiff': None, 'plaintiff_attorney': None,
+                 'defendant': None, 'defendant_attorney': None} for r in rows]
+
+    if src.get('parties'):
+        # Civil: names/attorneys live in per-party tables.
+        p_tbl, d_tbl = src['parties']
+        def party(tbl, col):
+            return ('(SELECT string_agg(x."%s", \'; \') FROM "%s" x WHERE x.case_id = c.id)'
+                    % (col, tbl))
+        plaintiff = party(p_tbl, 'Name')
+        plaintiff_att = party(p_tbl, 'Attorney')
+        defendant = party(d_tbl, 'Name')
+        defendant_att = party(d_tbl, 'Attorney')
+    else:
+        # Criminal: single defendant on the case row, no plaintiff.
+        plaintiff = 'NULL'
+        plaintiff_att = 'NULL'
+        defendant = 'c."%s"' % src['defendant']
+        defendant_att = 'c."%s"' % src['defendant_attorney']
+
+    if sort in SORTABLE_CASE_COLUMNS:
+        order_by = '%s %s NULLS LAST, rc.id DESC' % (sort, direction)
+    else:
+        order_by = 'rc.collected_at DESC NULLS LAST, rc.id DESC'
+
+    sql = (
+        'SELECT rc.case_number AS case_number, rc.fips AS fips, '
+        'rc.case_type AS case_type, c.id AS case_id, c."%s" AS case_subtype, '
+        'c."%s" AS judgement, c."%s" AS case_date, '
+        '%s AS plaintiff, %s AS plaintiff_attorney, '
+        '%s AS defendant, %s AS defendant_attorney '
+        'FROM retrieved_cases rc '
+        'LEFT JOIN "%s" c ON c.fips = rc.fips AND c."CaseNumber" = rc.case_number '
+        'WHERE rc.batch_id = :b '
+        'ORDER BY %s'
+    ) % (src['subtype'], src['judgement'], src['date'],
+         plaintiff, plaintiff_att, defendant, defendant_att, src['table'], order_by) + tail
+
+    return [{
+        'case_number': r[0],
+        'fips': str(r[1]).zfill(3),
+        'case_type': r[2],
+        'case_id': r[3],
+        'case_subtype': r[4],
+        'judgement': r[5],
+        'case_date': r[6].isoformat() if r[6] else None,
+        'plaintiff': r[7],
+        'plaintiff_attorney': r[8],
+        'defendant': r[9],
+        'defendant_attorney': r[10],
+    } for r in conn.execute(text(sql), params)]
+
+
+@app.route('/api/batches/<int:batch_id>/cases')
+def batch_cases(batch_id):
+    try:
+        page = max(0, int(request.args.get('page', 0)))
+    except (TypeError, ValueError):
+        page = 0
+    cases = []
+    total = 0
+    try:
+        with engine.connect() as conn:
+            total = conn.execute(text(
+                'SELECT COUNT(*) FROM retrieved_cases WHERE batch_id = :b'
+            ), {'b': batch_id}).scalar() or 0
+            direction = 'DESC' if (request.args.get('dir') or '').lower() == 'desc' else 'ASC'
+            cases = fetch_batch_cases(
+                conn, batch_id, request.args.get('sort') or '', direction,
+                BATCH_CASES_PER_PAGE, page * BATCH_CASES_PER_PAGE)
+    except Exception:
+        pass
+    return jsonify({'page': page, 'per_page': BATCH_CASES_PER_PAGE, 'total': total, 'cases': cases})
+
+
+@app.route('/api/batches/<int:batch_id>/export')
+def export_batch(batch_id):
+    """Download every case in a batch as CSV (opens directly in Excel)."""
+    direction = 'DESC' if (request.args.get('dir') or '').lower() == 'desc' else 'ASC'
+    try:
+        with engine.connect() as conn:
+            batch = conn.execute(text(
+                'SELECT name FROM task_batches WHERE id = :b'
+            ), {'b': batch_id}).first()
+            rows = fetch_batch_cases(conn, batch_id, request.args.get('sort') or '', direction)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow([label for _key, label in CASE_EXPORT_COLUMNS])
+    for row in rows:
+        writer.writerow([row.get(key) for key, _label in CASE_EXPORT_COLUMNS])
+
+    label = (batch[0] if batch and batch[0] else 'batch-%d' % batch_id)
+    safe = re.sub(r'[^A-Za-z0-9._-]+', '-', label).strip('-') or ('batch-%d' % batch_id)
+    return Response(
+        buf.getvalue(),
+        mimetype='text/csv',
+        headers={'Content-Disposition': 'attachment; filename="%s-%d.csv"' % (safe, batch_id)}
+    )
+
+
+@app.route('/api/batches/<int:batch_id>/export.xlsx')
+def export_batch_xlsx(batch_id):
+    """Download every case in a batch as a real Excel workbook."""
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        return jsonify({'ok': False,
+                        'error': 'openpyxl is not installed (pip install openpyxl)'}), 500
+
+    direction = 'DESC' if (request.args.get('dir') or '').lower() == 'desc' else 'ASC'
+    try:
+        with engine.connect() as conn:
+            batch = conn.execute(text(
+                'SELECT name FROM task_batches WHERE id = :b'
+            ), {'b': batch_id}).first()
+            rows = fetch_batch_cases(conn, batch_id, request.args.get('sort') or '', direction)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = 'Cases'
+    ws.append([label for _key, label in CASE_EXPORT_COLUMNS])
+    for c in ws[1]:
+        c.font = Font(bold=True)
+
+    for row in rows:
+        values = []
+        for key, _label in CASE_EXPORT_COLUMNS:
+            val = row.get(key)
+            # Write real dates so Excel treats them as dates, not text. FIPS
+            # stays a string so its leading zeros survive.
+            if key == 'case_date' and val:
+                try:
+                    val = datetime.strptime(val, '%Y-%m-%d').date()
+                except (TypeError, ValueError):
+                    pass
+            values.append(val)
+        ws.append(values)
+
+    ws.freeze_panes = 'A2'
+    ws.auto_filter.ref = ws.dimensions
+    for i, (key, label) in enumerate(CASE_EXPORT_COLUMNS, start=1):
+        longest = max([len(label)] + [len(str(r.get(key) or '')) for r in rows] or [0])
+        ws.column_dimensions[get_column_letter(i)].width = min(max(longest + 2, 10), 40)
+
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    label = (batch[0] if batch and batch[0] else 'batch-%d' % batch_id)
+    safe = re.sub(r'[^A-Za-z0-9._-]+', '-', label).strip('-') or ('batch-%d' % batch_id)
+    return Response(
+        bio.getvalue(),
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        headers={'Content-Disposition': 'attachment; filename="%s-%d.xlsx"' % (safe, batch_id)}
+    )
+
+
 @app.route('/')
 def index():
     return PAGE
+
+
+@app.route('/data')
+def data_page():
+    return DATA_PAGE
 
 
 PAGE = """<!DOCTYPE html>
@@ -536,7 +850,10 @@ PAGE = """<!DOCTYPE html>
 <body>
   <div class="top">
     <h1>Virginia Court Scraper &mdash; Worker Dashboard</h1>
-    <button class="logs-btn" onclick="openLogs()">Worker logs</button>
+    <span>
+      <a class="logs-btn" href="/data" style="text-decoration:none;">Collected data</a>
+      <button class="logs-btn" onclick="openLogs()">Worker logs</button>
+    </span>
   </div>
   <div class="meta" id="meta">Loading&hellip;</div>
   <div class="modal" id="logs-modal" style="display:none;">
@@ -555,6 +872,9 @@ PAGE = """<!DOCTYPE html>
   <div class="scheduler" style="margin-top:24px;">
     <h2>Task Scheduler</h2>
     <div class="row">
+      <label>Name (optional)
+        <input type="text" id="sch-name" placeholder="batch name" size="16">
+      </label>
       <label>Court level
         <select id="sch-court" onchange="loadCourts()"><option value="district">district</option><option value="circuit">circuit</option></select>
       </label>
@@ -673,6 +993,7 @@ function createTasks() {
   var checked = document.querySelectorAll('#sch-courts input:checked');
   var fips = Array.prototype.map.call(checked, function(c){ return c.value; });
   var body = {
+    name: document.getElementById('sch-name').value,
     court_type: document.getElementById('sch-court').value,
     case_type: document.getElementById('sch-case').value,
     start_date: document.getElementById('sch-start').value,
@@ -882,6 +1203,185 @@ function refresh() {
 }
 loadCourts();
 refresh();
+</script>
+</body>
+</html>"""
+
+
+DATA_PAGE = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>VA Court Scraper - Collected Data</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; background: #0f1115; color: #e6e6e6; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 16px; margin: 0 0 12px; }
+  .top { display: flex; align-items: center; justify-content: space-between; }
+  .link { background: #21262d; color: #e6e6e6; border: 1px solid #30363d; border-radius: 6px; padding: 6px 12px; cursor: pointer; text-decoration: none; font-size: 13px; }
+  .link:hover { background: #30363d; }
+  .meta { color: #8a8f98; font-size: 13px; margin-bottom: 20px; }
+  .grid { display: flex; gap: 24px; flex-wrap: wrap; }
+  .box { flex: 1; min-width: 420px; background: #171a21; border: 1px solid #262b36; border-radius: 8px; padding: 16px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #262b36; }
+  th { color: #8a8f98; font-weight: 500; font-size: 11px; text-transform: uppercase; }
+  .batch-item { border-bottom: 1px solid #262b36; }
+  .batch-head { display: flex; align-items: center; gap: 10px; padding: 9px 4px; cursor: pointer; }
+  .batch-head:hover { background: #1f242c; }
+  .batch-head.open { background: #21262d; }
+  .caret { color: #8a8f98; width: 12px; display: inline-block; }
+  .bname { font-weight: 600; }
+  .bmeta { color: #8a8f98; font-size: 12px; flex: 1; }
+  .bcount { color: #8a8f98; font-size: 12px; white-space: nowrap; }
+  .export { background: #21262d; color: #e6e6e6; border: 1px solid #30363d; border-radius: 6px; padding: 3px 10px; font-size: 12px; text-decoration: none; white-space: nowrap; }
+  .export:hover { background: #30363d; }
+  .batch-detail { padding: 4px 4px 12px 26px; }
+  /* Fixed layout so all columns fit without side-scrolling; long values are
+     clipped with an ellipsis (full text is in each cell's tooltip). */
+  .ctable { table-layout: fixed; width: 100%; }
+  .ctable th, .ctable td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  th.sortable { cursor: pointer; user-select: none; }
+  th.sortable:hover { color: #e6e6e6; }
+  .search { background: #0f1115; color: #e6e6e6; border: 1px solid #30363d; border-radius: 6px; padding: 6px 8px; font-size: 13px; margin-bottom: 12px; width: 220px; }
+  .empty { color: #8a8f98; font-style: italic; padding: 8px; }
+  .pager { display: flex; align-items: center; gap: 12px; margin-top: 12px; font-size: 13px; color: #8a8f98; }
+  .pager button { background: #21262d; color: #e6e6e6; border: 1px solid #30363d; border-radius: 6px; padding: 5px 12px; cursor: pointer; }
+  .pager button[disabled] { opacity: .4; cursor: default; }
+</style>
+</head>
+<body>
+  <div class="top">
+    <h1>Virginia Court Scraper &mdash; Collected Data</h1>
+    <a class="link" href="/">&larr; Dashboard</a>
+  </div>
+  <div class="meta" id="meta">Loading&hellip;</div>
+  <div class="box">
+    <h2>Task batches</h2>
+    <input type="text" id="batch-search" class="search" placeholder="Search by name&hellip;" oninput="renderBatches()">
+    <div id="batches"></div>
+  </div>
+<script>
+function fmtWhen(iso) {
+  if (!iso) return '';
+  var d = new Date(iso);
+  var secs = Math.floor((Date.now() - d.getTime()) / 1000);
+  if (secs < 60) return secs + 's ago';
+  if (secs < 3600) return Math.floor(secs / 60) + 'm ago';
+  if (secs < 86400) return Math.floor(secs / 3600) + 'h ago';
+  return Math.round(secs / 86400) + 'd ago';
+}
+var batchesById = {};
+var allBatches = [];
+var currentBatch = null;
+var batchPage = 0;
+function loadBatches() {
+  fetch('/api/batches').then(function(r){ return r.json(); }).then(function(d){
+    allBatches = d.batches || [];
+    batchesById = {};
+    allBatches.forEach(function(b){ batchesById[b.id] = b; });
+    renderBatches();
+  });
+}
+function renderBatches() {
+  var q = (document.getElementById('batch-search').value || '').toLowerCase().trim();
+  var list = allBatches.filter(function(b){
+    return !q || (b.name && b.name.toLowerCase().indexOf(q) !== -1);
+  });
+  var html = list.map(function(b){
+    var open = (b.id === currentBatch);
+    var head = '<div class="batch-head' + (open ? ' open' : '') + '" onclick="toggleBatch(' + b.id + ')">' +
+      '<span class="caret">' + (open ? '&#9662;' : '&#9656;') + '</span>' +
+      '<span class="bname">' + (b.name || '&mdash;') + '</span>' +
+      '<span class="bmeta">' + b.court_type + ' ' + b.case_type + ' &middot; ' +
+        (b.end_date || '') + ' &rarr; ' + (b.start_date || '') + ' &middot; ' + fmtWhen(b.created_at) + '</span>' +
+      '<span class="bcount">' + b.cases + ' cases</span>' +
+      '<a class="export" href="/api/batches/' + b.id + '/export.xlsx" onclick="event.stopPropagation()">Excel</a>' +
+      '<a class="export" href="/api/batches/' + b.id + '/export" onclick="event.stopPropagation()">CSV</a></div>';
+    var detail = open ? '<div class="batch-detail" id="detail-' + b.id + '">Loading&hellip;</div>' : '';
+    return '<div class="batch-item">' + head + detail + '</div>';
+  }).join('');
+  document.getElementById('batches').innerHTML = html ||
+    '<div class="empty">' + (allBatches.length ? 'No batches match your search' : 'No task batches yet') + '</div>';
+  document.getElementById('meta').textContent = list.length + ' batch(es)' + (q ? ' matching "' + q + '"' : '');
+  if (currentBatch !== null) loadCases();
+}
+function toggleBatch(id) {
+  if (currentBatch === id) {
+    currentBatch = null;
+  } else {
+    currentBatch = id;
+    batchPage = 0;
+  }
+  renderBatches();
+}
+var sortCol = null;
+var sortDir = 'asc';
+function esc(v) {
+  if (v === null || v === undefined) return '';
+  return String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                  .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+function cell(v) {
+  // Clipped to the column width by CSS; the tooltip carries the full value.
+  var s = esc(v);
+  return '<td title="' + s + '">' + (s || '&mdash;') + '</td>';
+}
+function th(col, label) {
+  var arrow = (sortCol === col) ? (sortDir === 'asc' ? ' &#9650;' : ' &#9660;') : '';
+  return '<th class="sortable" onclick="sortCases(&#39;' + col + '&#39;)">' + label + arrow + '</th>';
+}
+function sortCases(col) {
+  if (sortCol === col) {
+    sortDir = (sortDir === 'asc') ? 'desc' : 'asc';
+  } else {
+    sortCol = col;
+    sortDir = 'asc';
+  }
+  batchPage = 0;
+  loadCases();
+}
+function loadCases() {
+  if (currentBatch === null) return;
+  if (!document.getElementById('detail-' + currentBatch)) return;
+  var url = '/api/batches/' + currentBatch + '/cases?page=' + batchPage;
+  if (sortCol) url += '&sort=' + sortCol + '&dir=' + sortDir;
+  fetch(url)
+    .then(function(r){ return r.json(); }).then(function(d){
+      var rows = (d.cases || []).map(function(c){
+        return '<tr>' + cell(c.case_id) + cell(c.case_number) + cell(c.case_type) +
+          cell(c.case_subtype) + cell(c.judgement) + cell(c.fips) + cell(c.case_date) +
+          cell(c.plaintiff) + cell(c.plaintiff_attorney) + cell(c.defendant) +
+          cell(c.defendant_attorney) + '</tr>';
+      }).join('');
+      var header = th('case_id', 'Case id') + th('case_number', 'Case number') +
+        th('case_type', 'Category') + th('case_subtype', 'Case type') +
+        th('judgement', 'Judgement') + th('fips', 'FIPS') + th('case_date', 'Case date') +
+        th('plaintiff', 'Plaintiff') + th('plaintiff_attorney', 'Plaintiff attorney') +
+        th('defendant', 'Defendant') + th('defendant_attorney', 'Defendant attorney');
+      var widths = [6, 12, 7, 10, 11, 5, 8, 11, 10, 11, 9];
+      var cols = '<colgroup>' + widths.map(function(w){
+        return '<col style="width:' + w + '%">';
+      }).join('') + '</colgroup>';
+      var table = d.cases.length
+        ? '<table class="ctable">' + cols + '<tr>' + header + '</tr>' + rows + '</table>'
+        : '<div class="empty">No cases recorded for this batch yet</div>';
+      var totalPages = Math.max(1, Math.ceil(d.total / d.per_page));
+      var pager = '<div class="pager">' +
+        '<button onclick="changeBatchPage(-1)" ' + (d.page <= 0 ? 'disabled' : '') + '>&larr; Prev</button>' +
+        '<span>Page ' + (d.page + 1) + ' of ' + totalPages + ' (' + d.total + ' cases)</span>' +
+        '<button onclick="changeBatchPage(1)" ' + ((d.page + 1) >= totalPages ? 'disabled' : '') + '>Next &rarr;</button>' +
+        '</div>';
+      var t = document.getElementById('detail-' + currentBatch);
+      if (t) t.innerHTML = table + pager;
+    });
+}
+function changeBatchPage(delta) {
+  batchPage = Math.max(0, batchPage + delta);
+  loadCases();
+}
+loadBatches();
+setInterval(loadBatches, 10000);
 </script>
 </body>
 </html>"""
