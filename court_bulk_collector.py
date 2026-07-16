@@ -115,7 +115,7 @@ def start_worker_presence(interval=15):
     t = threading.Thread(target=beat, daemon=True)
     t.start()
 
-def get_cases_on_date(db, reader, fips, case_type, date, dateStr):
+def get_cases_on_date(db, reader, fips, case_type, date, dateStr, batch_id=None):
     print('Getting cases on ' + dateStr)
     sleep(1)
     cases = reader.get_cases_by_date(fips, case_type, dateStr)
@@ -135,6 +135,7 @@ def get_cases_on_date(db, reader, fips, case_type, date, dateStr):
                     case['CaseType'] = case['civil_case_type']
                     case['Plaintiff'] = case['plaintiff']
                 db.add_case_to_docket(case, case_type)
+                db.record_retrieved_case(batch_id, case_type, fips, case['case_number'])
                 continue
 
             case_details = db.get_more_recent_case_details(case, case_type, date)
@@ -169,6 +170,7 @@ def get_cases_on_date(db, reader, fips, case_type, date, dateStr):
             else:
                 print('[%s] [%d/%d] %s %s' % (fips, i, total_cases, case['case_number'], case['defendant']))
                 db.replace_case_details(case, case_type)
+                db.record_retrieved_case(batch_id, case_type, fips, case['case_number'])
         except Exception as err:
             # Let timeouts bubble up so the whole date is retried later; skip a
             # single problematic case rather than abandoning the entire task.
@@ -249,6 +251,7 @@ def run_collector(reader, last_task):
         start_date = task['start_date']
         end_date = task['end_date']
         case_type = task['case_type']
+        batch_id = task.get('batch_id')
 
         print('Start %s %s %s-%s' % (
                  fips,
@@ -276,7 +279,7 @@ def run_collector(reader, last_task):
                     reader.connect()
                     reader_connected = True
                 try:
-                    get_cases_on_date(db, reader, fips, case_type, date, date_str)
+                    get_cases_on_date(db, reader, fips, case_type, date, date_str, batch_id)
                     db.add_date_search(date_search)
                     searched_dates.add(date_str)
                 except Exception as err:

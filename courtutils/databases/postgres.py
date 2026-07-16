@@ -48,6 +48,7 @@ class DateTask():
     startdate = Column(Date)
     enddate = Column(Date)
     casetype = Column(String)
+    batch_id = Column(Integer)  # which task-creation batch this belongs to
 
 class CircuitCourtDateTask(Base, DateTask):
     __tablename__ = 'circuit_court_date_tasks'
@@ -62,6 +63,7 @@ class ActiveDateTask():
     enddate = Column(Date)
     casetype = Column(String)
     last_alive = Column(DateTime, default=datetime)
+    batch_id = Column(Integer)
 
 class CircuitCourtActiveDateTask(Base, ActiveDateTask):
     __tablename__ = 'circuit_court_active_date_tasks'
@@ -76,12 +78,39 @@ class CompletedDateTask():
     enddate = Column(Date)
     casetype = Column(String)
     completed_at = Column(DateTime, default=datetime)
+    batch_id = Column(Integer)
 
 class CircuitCourtCompletedDateTask(Base, CompletedDateTask):
     __tablename__ = 'circuit_court_completed_date_tasks'
 
 class DistrictCourtCompletedDateTask(Base, CompletedDateTask):
     __tablename__ = 'district_court_completed_date_tasks'
+
+# One row per "create a set of tasks" action (from the dashboard or the CLI).
+class TaskBatch(Base):
+    __tablename__ = 'task_batches'
+    id = Column(Integer, primary_key=True)
+    name = Column(String)
+    created_at = Column(DateTime)
+    court_type = Column(String)
+    case_type = Column(String)
+    startdate = Column(Date)
+    enddate = Column(Date)
+
+# Link table: which cases a batch retrieved, and when. The case's own details
+# (type, judgement, parties, dates) are read live from the case tables by
+# joining on fips + case_number, so they never go stale. Note the case row's id
+# can't be cached here: replace_case_details deletes and re-inserts the row on
+# every re-collection, which would change it.
+class RetrievedCase(Base):
+    __tablename__ = 'retrieved_cases'
+    id = Column(BigInteger, primary_key=True)
+    batch_id = Column(Integer)
+    court_type = Column(String)
+    case_type = Column(String)
+    fips = Column(Integer)
+    case_number = Column(String)
+    collected_at = Column(DateTime)
 
 # Tracks each running collector process so the dashboard can show workers even
 # when they are idle (between tasks), not just when they hold an active task.
@@ -682,6 +711,10 @@ TABLES = [
     CircuitCourtCompletedDateTask,
     DistrictCourtCompletedDateTask,
 
+    # Batches and retrieved-case tracking
+    TaskBatch,
+    RetrievedCase,
+
     # Workers
     Worker,
     WorkerTarget,
@@ -748,16 +781,23 @@ class PostgresDatabase():
         # ACCESS EXCLUSIVE lock even for "ADD COLUMN IF NOT EXISTS", so running
         # it on every connection serializes against heartbeat updates and reads.
         from sqlalchemy import text
+        def add_column_if_missing(conn, table_name, column, coltype):
+            present = conn.execute(text(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_name = :t AND column_name = :c"
+            ), {'t': table_name, 'c': column}).scalar()
+            if not present:
+                conn.execute(text("ALTER TABLE %s ADD COLUMN %s %s" % (table_name, column, coltype)))
+
         with self.engine.connect() as conn:
             for table_name in ['circuit_court_active_date_tasks', 'district_court_active_date_tasks']:
-                exists = conn.execute(text(
-                    "SELECT 1 FROM information_schema.columns "
-                    "WHERE table_name = :t AND column_name = 'last_alive'"
-                ), {'t': table_name}).scalar()
-                if not exists:
-                    conn.execute(
-                        text("ALTER TABLE %s ADD COLUMN last_alive TIMESTAMP" % table_name)
-                    )
+                add_column_if_missing(conn, table_name, 'last_alive', 'TIMESTAMP')
+            # batch_id links tasks (and, through them, retrieved cases) to the
+            # task-creation batch they belong to.
+            for table_name in ['circuit_court_date_tasks', 'district_court_date_tasks',
+                               'circuit_court_active_date_tasks', 'district_court_active_date_tasks',
+                               'circuit_court_completed_date_tasks', 'district_court_completed_date_tasks']:
+                add_column_if_missing(conn, table_name, 'batch_id', 'INTEGER')
             conn.commit()
 
         self.court_type = court_type
@@ -802,14 +842,45 @@ class PostgresDatabase():
     def count_courts(self):
         return self.session.query(self.court_builder).count()
 
-    def add_date_tasks(self, tasks):
+    def create_batch(self, case_type, start_date, end_date, name=None):
+        """Record a task-creation batch and return its id, so the cases later
+        retrieved for these tasks can be tracked back to this batch."""
+        batch = TaskBatch(
+            name=name,
+            created_at=datetime.now(),
+            court_type=self.court_type,
+            case_type=case_type,
+            startdate=start_date,
+            enddate=end_date
+        )
+        self.session.add(batch)
+        self.session.commit()
+        return batch.id
+
+    def record_retrieved_case(self, batch_id, case_type, fips, case_number):
+        if batch_id is None:
+            return
+        self.session.add(
+            RetrievedCase(
+                batch_id=batch_id,
+                court_type=self.court_type,
+                case_type=case_type,
+                fips=int(fips),
+                case_number=case_number,
+                collected_at=datetime.now()
+            )
+        )
+        self.session.commit()
+
+    def add_date_tasks(self, tasks, batch_id=None):
         for task in tasks:
             self.session.add(
                 self.date_task_builder(
                     fips=int(task['fips']),
                     startdate=task['start_date'],
                     enddate=task['end_date'],
-                    casetype=task['case_type']
+                    casetype=task['case_type'],
+                    batch_id=batch_id
                 )
             )
         self.session.commit()
@@ -821,7 +892,8 @@ class PostgresDatabase():
                 startdate=task['start_date'],
                 enddate=task['end_date'],
                 casetype=task['case_type'],
-                completed_at=datetime.now()
+                completed_at=datetime.now(),
+                batch_id=task.get('batch_id')
             )
         )
         self.session.commit()
@@ -846,7 +918,8 @@ class PostgresDatabase():
                 fips=int(task['fips']),
                 startdate=task['start_date'],
                 enddate=task['end_date'],
-                casetype=task['case_type']
+                casetype=task['case_type'],
+                batch_id=task.get('batch_id')
             )
         )
         if stopping_work:
@@ -897,7 +970,8 @@ class PostgresDatabase():
                         startdate=task.startdate,
                         enddate=task.enddate,
                         casetype=task.casetype,
-                        last_alive=datetime.now()
+                        last_alive=datetime.now(),
+                        batch_id=task.batch_id
                     )
                 )
                 self.session.commit()
@@ -906,7 +980,8 @@ class PostgresDatabase():
                     'fips': str(task.fips).zfill(3),
                     'start_date': task.startdate,
                     'end_date': task.enddate,
-                    'case_type': task.casetype
+                    'case_type': task.casetype,
+                    'batch_id': task.batch_id
                 }
             except IntegrityError:
                 print('WARNING - FAILED TO GET NEW TASK')
@@ -933,7 +1008,8 @@ class PostgresDatabase():
                     fips=task.fips,
                     startdate=task.startdate,
                     enddate=task.enddate,
-                    casetype=task.casetype
+                    casetype=task.casetype,
+                    batch_id=task.batch_id
                 )
             )
             self.session.delete(task)
