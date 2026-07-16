@@ -104,7 +104,9 @@ def collect_court_status(conn, court_type):
     try:
         rows = conn.execute(text(
             'SELECT fips, casetype, startdate, enddate, last_alive '
-            'FROM %s ORDER BY last_alive DESC NULLS LAST' % active_table
+            # Stable order: sorting by last_alive would reshuffle the rows on
+            # every heartbeat.
+            'FROM %s ORDER BY fips, casetype' % active_table
         ))
         now = datetime.now()
         for r in rows:
@@ -151,7 +153,7 @@ def collect_court_status(conn, court_type):
         now = datetime.now()
         rows = conn.execute(text(
             "SELECT worker_id, last_alive FROM workers "
-            "WHERE court_type = :ct AND status = 'idle' ORDER BY last_alive DESC"
+            "WHERE court_type = :ct AND status = 'idle' ORDER BY worker_id"
         ), {'ct': court_type})
         for r in rows:
             idle.append({
