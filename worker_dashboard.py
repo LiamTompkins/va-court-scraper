@@ -1298,8 +1298,8 @@ function renderBatches() {
       '<span class="bmeta">' + b.court_type + ' ' + b.case_type + ' &middot; ' +
         (b.end_date || '') + ' &rarr; ' + (b.start_date || '') + ' &middot; ' + fmtWhen(b.created_at) + '</span>' +
       '<span class="bcount">' + b.cases + ' cases</span>' +
-      '<a class="export" href="/api/batches/' + b.id + '/export.xlsx" onclick="event.stopPropagation()">Excel</a>' +
-      '<a class="export" href="/api/batches/' + b.id + '/export" onclick="event.stopPropagation()">CSV</a></div>';
+      '<a class="export" href="/api/batches/' + b.id + '/export.xlsx" onclick="event.stopPropagation()">Download Excel</a>' +
+      '<a class="export" href="/api/batches/' + b.id + '/export" onclick="event.stopPropagation()">Download CSV</a></div>';
     var detail = open ? '<div class="batch-detail" id="detail-' + b.id + '">Loading&hellip;</div>' : '';
     return '<div class="batch-item">' + head + detail + '</div>';
   }).join('');
