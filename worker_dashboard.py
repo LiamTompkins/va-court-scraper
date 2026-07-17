@@ -1321,18 +1321,45 @@ function loadBatches() {
     renderBatches();
   });
 }
-function renderBatches() {
+var lastStructSig = null;
+function visibleBatches() {
   var q = (document.getElementById('batch-search').value || '').toLowerCase().trim();
-  var list = allBatches.filter(function(b){
+  return allBatches.filter(function(b){
     return !q || (b.name && b.name.toLowerCase().indexOf(q) !== -1);
   });
+}
+function batchMeta(b) {
+  return b.court_type + ' ' + b.case_type + ' &middot; ' +
+    (b.end_date || '') + ' &rarr; ' + (b.start_date || '') + ' &middot; ' + fmtWhen(b.created_at);
+}
+function renderBatches() {
+  var q = (document.getElementById('batch-search').value || '').toLowerCase().trim();
+  var list = visibleBatches();
+  // Rebuild the DOM only when the structure changes (which batches show and
+  // which one is open). On plain data refreshes we update fields in place so
+  // the open batch's detail (and the case table) never flashes.
+  var structSig = currentBatch + '|' + list.map(function(b){ return b.id; }).join(',');
+  if (structSig === lastStructSig) {
+    list.forEach(function(b){
+      var item = document.getElementById('bitem-' + b.id);
+      if (!item) return;
+      var cnt = item.querySelector('.bcount');
+      if (cnt) cnt.textContent = b.cases + ' cases';
+      var meta = item.querySelector('.bmeta');
+      if (meta) meta.innerHTML = batchMeta(b);
+    });
+    document.getElementById('meta').textContent =
+      list.length + ' batch(es)' + (q ? ' matching "' + q + '"' : '');
+    if (currentBatch !== null) loadCases();
+    return;
+  }
+  lastStructSig = structSig;
   var html = list.map(function(b){
     var open = (b.id === currentBatch);
     var head = '<div class="batch-head' + (open ? ' open' : '') + '" onclick="toggleBatch(' + b.id + ')">' +
       '<span class="caret">' + (open ? '&#9662;' : '&#9656;') + '</span>' +
       '<span class="bname">' + (b.name || '&mdash;') + '</span>' +
-      '<span class="bmeta">' + b.court_type + ' ' + b.case_type + ' &middot; ' +
-        (b.end_date || '') + ' &rarr; ' + (b.start_date || '') + ' &middot; ' + fmtWhen(b.created_at) + '</span>' +
+      '<span class="bmeta">' + batchMeta(b) + '</span>' +
       '<span class="bcount">' + b.cases + ' cases</span>' +
       '<a class="export" href="#" onclick="event.stopPropagation();exportBatch(' + b.id + ',&#39;xlsx&#39;);return false;">Download Excel</a>' +
       '<a class="export" href="#" onclick="event.stopPropagation();exportBatch(' + b.id + ',&#39;csv&#39;);return false;">Download CSV</a></div>';
@@ -1345,7 +1372,7 @@ function renderBatches() {
         '</div>' +
         '<div id="cases-body-' + b.id + '">Loading&hellip;</div></div>';
     }
-    return '<div class="batch-item">' + head + detail + '</div>';
+    return '<div class="batch-item" id="bitem-' + b.id + '">' + head + detail + '</div>';
   }).join('');
   document.getElementById('batches').innerHTML = html ||
     '<div class="empty">' + (allBatches.length ? 'No batches match your search' : 'No task batches yet') + '</div>';
