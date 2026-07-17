@@ -577,31 +577,42 @@ CASE_EXPORT_COLUMNS = [
 ]
 
 
-def fetch_batch_cases(conn, batch_id, sort=None, direction='ASC', limit=None, offset=0):
-    """Rows for a batch, joined live to the matching case table. Shared by the
-    paginated view and the CSV export so they can't drift apart. limit=None
-    returns every case in the batch."""
+def fetch_batch_cases(conn, batch_id, sort=None, direction='ASC', limit=None, offset=0,
+                      subtype_filter=None, judgement_filter=None):
+    """Rows for a batch (and the total matching), joined live to the matching
+    case table. Shared by the paginated view and the exports so they can't drift
+    apart. limit=None returns every matching case. Optional case-type/judgement
+    filters do a case-insensitive substring match on the joined columns.
+    Returns (cases, total)."""
     batch = conn.execute(text(
         'SELECT court_type, case_type FROM task_batches WHERE id = :b'
     ), {'b': batch_id}).first()
     src = CASE_SOURCES.get((batch[0], batch[1])) if batch else None
-
+    subtype_filter = (subtype_filter or '').strip()
+    judgement_filter = (judgement_filter or '').strip()
     params = {'b': batch_id}
-    if limit is not None:
-        params['lim'] = limit
-        params['off'] = offset
-    tail = ' LIMIT :lim OFFSET :off' if limit is not None else ''
 
     if src is None:
-        # Unknown court/case type - fall back to the link-table fields only.
+        # No case table to join - the filters target joined columns, so a set
+        # filter matches nothing.
+        if subtype_filter or judgement_filter:
+            return [], 0
+        total = conn.execute(text(
+            'SELECT COUNT(*) FROM retrieved_cases WHERE batch_id = :b'
+        ), {'b': batch_id}).scalar() or 0
+        tail = ''
+        if limit is not None:
+            params['lim'] = limit
+            params['off'] = offset
+            tail = ' LIMIT :lim OFFSET :off'
         rows = conn.execute(text(
             'SELECT case_number, fips, case_type FROM retrieved_cases '
             'WHERE batch_id = :b ORDER BY collected_at DESC NULLS LAST, id DESC' + tail
         ), params)
-        return [{'case_number': r[0], 'fips': str(r[1]).zfill(3), 'case_type': r[2],
-                 'case_id': None, 'case_subtype': None, 'judgement': None,
-                 'case_date': None, 'plaintiff': None, 'plaintiff_attorney': None,
-                 'defendant': None, 'defendant_attorney': None} for r in rows]
+        return ([{'case_number': r[0], 'fips': str(r[1]).zfill(3), 'case_type': r[2],
+                  'case_id': None, 'case_subtype': None, 'judgement': None,
+                  'case_date': None, 'plaintiff': None, 'plaintiff_attorney': None,
+                  'defendant': None, 'defendant_attorney': None} for r in rows], total)
 
     if src.get('parties'):
         # Civil: names/attorneys live in per-party tables.
@@ -620,25 +631,39 @@ def fetch_batch_cases(conn, batch_id, sort=None, direction='ASC', limit=None, of
         defendant = 'c."%s"' % src['defendant']
         defendant_att = 'c."%s"' % src['defendant_attorney']
 
+    join = ('FROM retrieved_cases rc '
+            'LEFT JOIN "%s" c ON c.fips = rc.fips AND c."CaseNumber" = rc.case_number'
+            % src['table'])
+    where = 'rc.batch_id = :b'
+    if subtype_filter:
+        where += ' AND c."%s" ILIKE :subf' % src['subtype']
+        params['subf'] = '%' + subtype_filter + '%'
+    if judgement_filter:
+        where += ' AND c."%s" ILIKE :judf' % src['judgement']
+        params['judf'] = '%' + judgement_filter + '%'
+
+    total = conn.execute(text(
+        'SELECT COUNT(*) %s WHERE %s' % (join, where)), params).scalar() or 0
+
     if sort in SORTABLE_CASE_COLUMNS:
         order_by = '%s %s NULLS LAST, rc.id DESC' % (sort, direction)
     else:
         order_by = 'rc.collected_at DESC NULLS LAST, rc.id DESC'
 
-    sql = (
-        'SELECT rc.case_number AS case_number, rc.fips AS fips, '
-        'rc.case_type AS case_type, c.id AS case_id, c."%s" AS case_subtype, '
-        'c."%s" AS judgement, c."%s" AS case_date, '
-        '%s AS plaintiff, %s AS plaintiff_attorney, '
-        '%s AS defendant, %s AS defendant_attorney '
-        'FROM retrieved_cases rc '
-        'LEFT JOIN "%s" c ON c.fips = rc.fips AND c."CaseNumber" = rc.case_number '
-        'WHERE rc.batch_id = :b '
-        'ORDER BY %s'
-    ) % (src['subtype'], src['judgement'], src['date'],
-         plaintiff, plaintiff_att, defendant, defendant_att, src['table'], order_by) + tail
+    tail = ''
+    if limit is not None:
+        params['lim'] = limit
+        params['off'] = offset
+        tail = ' LIMIT :lim OFFSET :off'
 
-    return [{
+    sql = (
+        'SELECT rc.case_number, rc.fips, rc.case_type, c.id, c."%s", c."%s", c."%s", '
+        '%s, %s, %s, %s '
+        '%s WHERE %s ORDER BY %s'
+    ) % (src['subtype'], src['judgement'], src['date'],
+         plaintiff, plaintiff_att, defendant, defendant_att, join, where, order_by) + tail
+
+    cases = [{
         'case_number': r[0],
         'fips': str(r[1]).zfill(3),
         'case_type': r[2],
@@ -651,6 +676,7 @@ def fetch_batch_cases(conn, batch_id, sort=None, direction='ASC', limit=None, of
         'defendant': r[9],
         'defendant_attorney': r[10],
     } for r in conn.execute(text(sql), params)]
+    return cases, total
 
 
 @app.route('/api/batches/<int:batch_id>/cases')
@@ -663,13 +689,11 @@ def batch_cases(batch_id):
     total = 0
     try:
         with engine.connect() as conn:
-            total = conn.execute(text(
-                'SELECT COUNT(*) FROM retrieved_cases WHERE batch_id = :b'
-            ), {'b': batch_id}).scalar() or 0
             direction = 'DESC' if (request.args.get('dir') or '').lower() == 'desc' else 'ASC'
-            cases = fetch_batch_cases(
+            cases, total = fetch_batch_cases(
                 conn, batch_id, request.args.get('sort') or '', direction,
-                BATCH_CASES_PER_PAGE, page * BATCH_CASES_PER_PAGE)
+                BATCH_CASES_PER_PAGE, page * BATCH_CASES_PER_PAGE,
+                request.args.get('subtype'), request.args.get('judgement'))
     except Exception:
         pass
     return jsonify({'page': page, 'per_page': BATCH_CASES_PER_PAGE, 'total': total, 'cases': cases})
@@ -677,14 +701,18 @@ def batch_cases(batch_id):
 
 @app.route('/api/batches/<int:batch_id>/export')
 def export_batch(batch_id):
-    """Download every case in a batch as CSV (opens directly in Excel)."""
+    """Download a batch's cases as CSV (opens directly in Excel), honoring any
+    sort/filter passed in the query string."""
     direction = 'DESC' if (request.args.get('dir') or '').lower() == 'desc' else 'ASC'
     try:
         with engine.connect() as conn:
             batch = conn.execute(text(
                 'SELECT name FROM task_batches WHERE id = :b'
             ), {'b': batch_id}).first()
-            rows = fetch_batch_cases(conn, batch_id, request.args.get('sort') or '', direction)
+            rows, _ = fetch_batch_cases(
+                conn, batch_id, request.args.get('sort') or '', direction,
+                subtype_filter=request.args.get('subtype'),
+                judgement_filter=request.args.get('judgement'))
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
 
@@ -720,7 +748,10 @@ def export_batch_xlsx(batch_id):
             batch = conn.execute(text(
                 'SELECT name FROM task_batches WHERE id = :b'
             ), {'b': batch_id}).first()
-            rows = fetch_batch_cases(conn, batch_id, request.args.get('sort') or '', direction)
+            rows, _ = fetch_batch_cases(
+                conn, batch_id, request.args.get('sort') or '', direction,
+                subtype_filter=request.args.get('subtype'),
+                judgement_filter=request.args.get('judgement'))
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
 
@@ -1239,6 +1270,9 @@ DATA_PAGE = """<!DOCTYPE html>
   .export { background: #21262d; color: #e6e6e6; border: 1px solid #30363d; border-radius: 6px; padding: 3px 10px; font-size: 12px; text-decoration: none; white-space: nowrap; }
   .export:hover { background: #30363d; }
   .batch-detail { padding: 4px 4px 12px 26px; }
+  .cfilter { display: flex; gap: 8px; margin: 2px 0 10px; }
+  .cfilter input { background: #0f1115; color: #e6e6e6; border: 1px solid #30363d; border-radius: 6px; padding: 5px 9px; font-size: 13px; min-width: 200px; }
+  .cfilter input::placeholder { color: #8b949e; }
   /* Fixed layout so all columns fit without side-scrolling; long values are
      clipped with an ellipsis (full text is in each cell's tooltip). */
   .ctable { table-layout: fixed; width: 100%; }
@@ -1277,6 +1311,8 @@ var batchesById = {};
 var allBatches = [];
 var currentBatch = null;
 var batchPage = 0;
+var filterSubtype = '';
+var filterJudgement = '';
 function loadBatches() {
   fetch('/api/batches').then(function(r){ return r.json(); }).then(function(d){
     allBatches = d.batches || [];
@@ -1298,9 +1334,17 @@ function renderBatches() {
       '<span class="bmeta">' + b.court_type + ' ' + b.case_type + ' &middot; ' +
         (b.end_date || '') + ' &rarr; ' + (b.start_date || '') + ' &middot; ' + fmtWhen(b.created_at) + '</span>' +
       '<span class="bcount">' + b.cases + ' cases</span>' +
-      '<a class="export" href="/api/batches/' + b.id + '/export.xlsx" onclick="event.stopPropagation()">Download Excel</a>' +
-      '<a class="export" href="/api/batches/' + b.id + '/export" onclick="event.stopPropagation()">Download CSV</a></div>';
-    var detail = open ? '<div class="batch-detail" id="detail-' + b.id + '">Loading&hellip;</div>' : '';
+      '<a class="export" href="#" onclick="event.stopPropagation();exportBatch(' + b.id + ',&#39;xlsx&#39;);return false;">Download Excel</a>' +
+      '<a class="export" href="#" onclick="event.stopPropagation();exportBatch(' + b.id + ',&#39;csv&#39;);return false;">Download CSV</a></div>';
+    var detail = '';
+    if (open) {
+      detail = '<div class="batch-detail" id="detail-' + b.id + '">' +
+        '<div class="cfilter">' +
+          '<input id="f-subtype" placeholder="Filter case type&hellip;" value="' + esc(filterSubtype) + '" onchange="applyFilter()">' +
+          '<input id="f-judgement" placeholder="Filter judgement&hellip;" value="' + esc(filterJudgement) + '" onchange="applyFilter()">' +
+        '</div>' +
+        '<div id="cases-body-' + b.id + '">Loading&hellip;</div></div>';
+    }
     return '<div class="batch-item">' + head + detail + '</div>';
   }).join('');
   document.getElementById('batches').innerHTML = html ||
@@ -1314,6 +1358,8 @@ function toggleBatch(id) {
   } else {
     currentBatch = id;
     batchPage = 0;
+    filterSubtype = '';
+    filterJudgement = '';
   }
   renderBatches();
 }
@@ -1345,9 +1391,11 @@ function sortCases(col) {
 }
 function loadCases() {
   if (currentBatch === null) return;
-  if (!document.getElementById('detail-' + currentBatch)) return;
+  if (!document.getElementById('cases-body-' + currentBatch)) return;
   var url = '/api/batches/' + currentBatch + '/cases?page=' + batchPage;
   if (sortCol) url += '&sort=' + sortCol + '&dir=' + sortDir;
+  if (filterSubtype) url += '&subtype=' + encodeURIComponent(filterSubtype);
+  if (filterJudgement) url += '&judgement=' + encodeURIComponent(filterJudgement);
   fetch(url)
     .then(function(r){ return r.json(); }).then(function(d){
       var rows = (d.cases || []).map(function(c){
@@ -1374,9 +1422,27 @@ function loadCases() {
         '<span>Page ' + (d.page + 1) + ' of ' + totalPages + ' (' + d.total + ' cases)</span>' +
         '<button onclick="changeBatchPage(1)" ' + ((d.page + 1) >= totalPages ? 'disabled' : '') + '>Next &rarr;</button>' +
         '</div>';
-      var t = document.getElementById('detail-' + currentBatch);
+      var t = document.getElementById('cases-body-' + currentBatch);
       if (t) t.innerHTML = table + pager;
     });
+}
+function applyFilter() {
+  var s = document.getElementById('f-subtype');
+  var j = document.getElementById('f-judgement');
+  filterSubtype = s ? s.value.trim() : '';
+  filterJudgement = j ? j.value.trim() : '';
+  batchPage = 0;
+  loadCases();
+}
+function exportBatch(id, fmt) {
+  var url = '/api/batches/' + id + '/export' + (fmt === 'xlsx' ? '.xlsx' : '');
+  var qs = [];
+  if (id === currentBatch) {
+    if (sortCol) { qs.push('sort=' + sortCol); qs.push('dir=' + sortDir); }
+    if (filterSubtype) qs.push('subtype=' + encodeURIComponent(filterSubtype));
+    if (filterJudgement) qs.push('judgement=' + encodeURIComponent(filterJudgement));
+  }
+  window.location = url + (qs.length ? '?' + qs.join('&') : '');
 }
 function changeBatchPage(delta) {
   batchPage = Math.max(0, batchPage + delta);
