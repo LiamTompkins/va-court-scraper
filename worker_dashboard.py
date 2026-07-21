@@ -840,64 +840,183 @@ def load_vplc_clients(conn):
     return clients
 
 
-@app.route('/api/batches/<int:batch_id>/conflicts')
-def batch_conflicts(batch_id):
+def compute_batch_conflicts(conn, batch_id):
     """Scan every party in a batch's cases against VPLC's PracticePanther client
-    list, flagging fuzzy name matches (potential conflicts of interest)."""
-    try:
-        with engine.connect() as conn:
-            clients = load_vplc_clients(conn)
-            if not clients:
-                return jsonify({'ok': True, 'clients_checked': 0, 'cases_scanned': 0,
-                                'conflicts': [],
-                                'note': 'No VPLC (PracticePanther) contacts found in the '
-                                        'shared database. Run the conflict checker\'s '
-                                        'PracticePanther sync first.'})
-            cases, _ = fetch_batch_cases(conn, batch_id)  # limit=None: all cases
+    list, flagging fuzzy name matches (potential conflicts of interest). Shared
+    by the JSON endpoint and the Excel export so they can't drift apart.
+    Returns (conflicts, clients_checked, cases_scanned, note); note is set (with
+    conflicts empty) when there are no VPLC contacts to check against."""
+    clients = load_vplc_clients(conn)
+    if not clients:
+        return [], 0, 0, ("No VPLC (PracticePanther) contacts found in the shared "
+                          "database. Run the conflict checker's PracticePanther sync first.")
+    cases, _ = fetch_batch_cases(conn, batch_id)  # limit=None: all cases
 
-        # Collect every non-empty party name, keyed by its normalized form, so a
-        # name shared across cases is scored once (rapidfuzz is C-fast, but this
-        # keeps a big batch cheap).
-        occurrences = {}
-        for c in cases:
-            for key, label in CONFLICT_PARTY_ROLES:
-                raw = c.get(key)
-                norm = normalize_name(raw)
-                if not norm:
-                    continue
-                occurrences.setdefault(norm, []).append({
-                    'case_number': c['case_number'], 'fips': c['fips'],
-                    'role': label, 'name': raw,
+    # Collect every non-empty party name, keyed by its normalized form, so a name
+    # shared across cases is scored once (rapidfuzz is C-fast, but this keeps a
+    # big batch cheap).
+    occurrences = {}
+    for c in cases:
+        for key, label in CONFLICT_PARTY_ROLES:
+            raw = c.get(key)
+            norm = normalize_name(raw)
+            if not norm:
+                continue
+            occurrences.setdefault(norm, []).append({
+                'case_number': c['case_number'], 'fips': c['fips'],
+                'role': label, 'name': raw, 'case': c,
+            })
+
+    client_norms = [cl['norm'] for cl in clients]
+    conflicts = []
+    for norm, occ_list in occurrences.items():
+        # token_sort_ratio is order-insensitive, so a normalized "smith john"
+        # matches a client stored as "john smith".
+        matches = process.extract(
+            norm, client_norms, scorer=fuzz.token_sort_ratio,
+            score_cutoff=CONFLICT_REVIEW_THRESHOLD, limit=None)
+        if not matches:
+            continue
+        for occ in occ_list:
+            for _matched, score, idx in matches:
+                cl = clients[idx]
+                conflicts.append({
+                    'score': int(round(score)),
+                    'level': 'exact' if score >= CONFLICT_EXACT_THRESHOLD else 'review',
+                    'case_number': occ['case_number'], 'fips': occ['fips'],
+                    'party_role': occ['role'], 'party_name': occ['name'],
+                    'client_name': cl['display_name'], 'client_role': cl['role'],
+                    'client_adverse': bool(cl['is_adverse']),
+                    'elh_case_number': cl['elh_case_number'],
+                    # Full Collected-Data case record, carried through to the
+                    # exports so each flagged row keeps all of the case's fields.
+                    'case': occ['case'],
                 })
 
-        client_norms = [cl['norm'] for cl in clients]
-        conflicts = []
-        for norm, occ_list in occurrences.items():
-            # token_sort_ratio is order-insensitive, so a normalized
-            # "smith john" matches a client stored as "john smith".
-            matches = process.extract(
-                norm, client_norms, scorer=fuzz.token_sort_ratio,
-                score_cutoff=CONFLICT_REVIEW_THRESHOLD, limit=None)
-            if not matches:
-                continue
-            for occ in occ_list:
-                for _matched, score, idx in matches:
-                    cl = clients[idx]
-                    conflicts.append({
-                        'score': int(round(score)),
-                        'level': 'exact' if score >= CONFLICT_EXACT_THRESHOLD else 'review',
-                        'case_number': occ['case_number'], 'fips': occ['fips'],
-                        'party_role': occ['role'], 'party_name': occ['name'],
-                        'client_name': cl['display_name'], 'client_role': cl['role'],
-                        'client_adverse': bool(cl['is_adverse']),
-                        'elh_case_number': cl['elh_case_number'],
-                    })
+    conflicts.sort(key=lambda x: x['score'], reverse=True)
+    return conflicts, len(clients), len(cases), None
 
-        conflicts.sort(key=lambda x: x['score'], reverse=True)
-        return jsonify({'ok': True, 'clients_checked': len(clients),
-                        'cases_scanned': len(cases), 'conflicts': conflicts})
+
+# The conflict exports lead with the match details, then append the flagged
+# case's full Collected-Data record (CASE_EXPORT_COLUMNS) so every field already
+# shown in the batch's case table is preserved. case_number/fips are omitted here
+# because they come from the case columns.
+CONFLICT_MATCH_COLUMNS = [
+    ('score', 'Match %'), ('level', 'Level'), ('party_role', 'Party role'),
+    ('party_name', 'Party name'), ('client_name', 'VPLC client'),
+    ('client_role', 'Client role'), ('client_adverse', 'Adverse'),
+    ('elh_case_number', 'ELH case'),
+]
+
+
+def _conflict_cell(row, key):
+    """Display value for one conflict-match field (booleans rendered as Yes/No)."""
+    val = row.get(key)
+    if key == 'client_adverse':
+        return 'Yes' if val else 'No'
+    return val
+
+
+def conflict_export_header():
+    return ([label for _k, label in CONFLICT_MATCH_COLUMNS] +
+            [label for _k, label in CASE_EXPORT_COLUMNS])
+
+
+def conflict_export_row(cf):
+    """One export row: match details followed by the flagged case's full record."""
+    case = cf.get('case') or {}
+    return ([_conflict_cell(cf, k) for k, _l in CONFLICT_MATCH_COLUMNS] +
+            [case.get(k) for k, _l in CASE_EXPORT_COLUMNS])
+
+
+@app.route('/api/batches/<int:batch_id>/conflicts')
+def batch_conflicts(batch_id):
+    try:
+        with engine.connect() as conn:
+            conflicts, clients_checked, cases_scanned, note = \
+                compute_batch_conflicts(conn, batch_id)
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
+    resp = {'ok': True, 'clients_checked': clients_checked,
+            'cases_scanned': cases_scanned, 'conflicts': conflicts}
+    if note:
+        resp['note'] = note
+    return jsonify(resp)
+
+
+@app.route('/api/batches/<int:batch_id>/conflicts.xlsx')
+def export_conflicts_xlsx(batch_id):
+    """Download a batch's potential conflicts as a real Excel workbook."""
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Font
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        return jsonify({'ok': False,
+                        'error': 'openpyxl is not installed (pip install openpyxl)'}), 500
+
+    try:
+        with engine.connect() as conn:
+            batch = conn.execute(text(
+                'SELECT name FROM task_batches WHERE id = :b'), {'b': batch_id}).first()
+            conflicts, _clients, _cases, _note = compute_batch_conflicts(conn, batch_id)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = 'Conflicts'
+    header = conflict_export_header()
+    ws.append(header)
+    for c in ws[1]:
+        c.font = Font(bold=True)
+    data_rows = [conflict_export_row(cf) for cf in conflicts]
+    for row in data_rows:
+        ws.append(row)
+
+    ws.freeze_panes = 'A2'
+    ws.auto_filter.ref = ws.dimensions
+    for i, label in enumerate(header, start=1):
+        longest = max([len(label)] +
+                      [len(str(r[i - 1] if r[i - 1] is not None else '')) for r in data_rows])
+        ws.column_dimensions[get_column_letter(i)].width = min(max(longest + 2, 10), 40)
+
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    label = (batch[0] if batch and batch[0] else 'batch-%d' % batch_id)
+    safe = re.sub(r'[^A-Za-z0-9._-]+', '-', label).strip('-') or ('batch-%d' % batch_id)
+    return Response(
+        bio.getvalue(),
+        mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        headers={'Content-Disposition': 'attachment; filename="%s-conflicts-%d.xlsx"' % (safe, batch_id)}
+    )
+
+
+@app.route('/api/batches/<int:batch_id>/conflicts.csv')
+def export_conflicts_csv(batch_id):
+    """Download a batch's potential conflicts as CSV (opens directly in Excel)."""
+    try:
+        with engine.connect() as conn:
+            batch = conn.execute(text(
+                'SELECT name FROM task_batches WHERE id = :b'), {'b': batch_id}).first()
+            conflicts, _clients, _cases, _note = compute_batch_conflicts(conn, batch_id)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(conflict_export_header())
+    for cf in conflicts:
+        writer.writerow(conflict_export_row(cf))
+
+    label = (batch[0] if batch and batch[0] else 'batch-%d' % batch_id)
+    safe = re.sub(r'[^A-Za-z0-9._-]+', '-', label).strip('-') or ('batch-%d' % batch_id)
+    return Response(
+        buf.getvalue(),
+        mimetype='text/csv',
+        headers={'Content-Disposition': 'attachment; filename="%s-conflicts-%d.csv"' % (safe, batch_id)}
+    )
 
 
 @app.route('/')
@@ -1625,7 +1744,9 @@ function checkConflicts(id) {
           '</tr>';
       }).join('');
       box.innerHTML = '<h3>' + cf.length + ' potential conflict(s) &mdash; ' + d.cases_scanned +
-        ' cases vs ' + d.clients_checked + ' clients</h3>' +
+        ' cases vs ' + d.clients_checked + ' clients' +
+        '<a class="export" style="margin-left:10px;" href="/api/batches/' + id + '/conflicts.xlsx">Download Excel</a>' +
+        '<a class="export" style="margin-left:6px;" href="/api/batches/' + id + '/conflicts.csv">Download CSV</a></h3>' +
         '<table><tr><th>Match</th><th>Case number</th><th>Party role</th>' +
         '<th>Party name</th><th>VPLC client</th><th>ELH case</th></tr>' + rows + '</table>';
     })
