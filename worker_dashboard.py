@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 
 from flask import Flask, jsonify, request, Response
 from sqlalchemy import create_engine, text
+from rapidfuzz import fuzz, process
 
 # Seconds without a heartbeat before an active task is considered stale.
 # Matches the threshold used by task_watchdog.py.
@@ -794,6 +795,111 @@ def export_batch_xlsx(batch_id):
     )
 
 
+# Conflict-check thresholds, mirrored from the elh-conflict-checker: a near
+# match needs volunteer review, a near-perfect match is treated as the same
+# person.
+CONFLICT_REVIEW_THRESHOLD = 80
+CONFLICT_EXACT_THRESHOLD = 99
+# Party name fields (from fetch_batch_cases) to check, with display labels.
+CONFLICT_PARTY_ROLES = [
+    ('plaintiff', 'Plaintiff'),
+    ('defendant', 'Defendant'),
+    ('plaintiff_attorney', 'Plaintiff attorney'),
+    ('defendant_attorney', 'Defendant attorney'),
+]
+_NAME_PUNCT = re.compile(r'[^a-z0-9 ]+')
+
+
+def normalize_name(name):
+    """Lowercase, strip punctuation, and collapse whitespace. Court records store
+    names as "LAST, FIRST" while PracticePanther stores "First Last"; stripping
+    the comma lets the token-based scorer match them regardless of word order."""
+    if not name:
+        return ''
+    return ' '.join(_NAME_PUNCT.sub(' ', name.lower()).split())
+
+
+def load_vplc_clients(conn):
+    """VPLC's PracticePanther contacts, cached by the conflict checker in the
+    shared 'pp_contact' table. Returns [] if the table doesn't exist yet (the
+    conflict checker has never synced)."""
+    try:
+        rows = conn.execute(text(
+            "SELECT display_name, first_name, last_name, role, is_adverse, elh_case_number "
+            "FROM pp_contact WHERE display_name IS NOT NULL AND display_name <> ''"
+        ))
+    except Exception:
+        return []
+    clients = []
+    for r in rows:
+        clients.append({
+            'display_name': r[0], 'first_name': r[1], 'last_name': r[2],
+            'role': r[3], 'is_adverse': r[4], 'elh_case_number': r[5],
+            'norm': normalize_name(r[0]),
+        })
+    return clients
+
+
+@app.route('/api/batches/<int:batch_id>/conflicts')
+def batch_conflicts(batch_id):
+    """Scan every party in a batch's cases against VPLC's PracticePanther client
+    list, flagging fuzzy name matches (potential conflicts of interest)."""
+    try:
+        with engine.connect() as conn:
+            clients = load_vplc_clients(conn)
+            if not clients:
+                return jsonify({'ok': True, 'clients_checked': 0, 'cases_scanned': 0,
+                                'conflicts': [],
+                                'note': 'No VPLC (PracticePanther) contacts found in the '
+                                        'shared database. Run the conflict checker\'s '
+                                        'PracticePanther sync first.'})
+            cases, _ = fetch_batch_cases(conn, batch_id)  # limit=None: all cases
+
+        # Collect every non-empty party name, keyed by its normalized form, so a
+        # name shared across cases is scored once (rapidfuzz is C-fast, but this
+        # keeps a big batch cheap).
+        occurrences = {}
+        for c in cases:
+            for key, label in CONFLICT_PARTY_ROLES:
+                raw = c.get(key)
+                norm = normalize_name(raw)
+                if not norm:
+                    continue
+                occurrences.setdefault(norm, []).append({
+                    'case_number': c['case_number'], 'fips': c['fips'],
+                    'role': label, 'name': raw,
+                })
+
+        client_norms = [cl['norm'] for cl in clients]
+        conflicts = []
+        for norm, occ_list in occurrences.items():
+            # token_sort_ratio is order-insensitive, so a normalized
+            # "smith john" matches a client stored as "john smith".
+            matches = process.extract(
+                norm, client_norms, scorer=fuzz.token_sort_ratio,
+                score_cutoff=CONFLICT_REVIEW_THRESHOLD, limit=None)
+            if not matches:
+                continue
+            for occ in occ_list:
+                for _matched, score, idx in matches:
+                    cl = clients[idx]
+                    conflicts.append({
+                        'score': int(round(score)),
+                        'level': 'exact' if score >= CONFLICT_EXACT_THRESHOLD else 'review',
+                        'case_number': occ['case_number'], 'fips': occ['fips'],
+                        'party_role': occ['role'], 'party_name': occ['name'],
+                        'client_name': cl['display_name'], 'client_role': cl['role'],
+                        'client_adverse': bool(cl['is_adverse']),
+                        'elh_case_number': cl['elh_case_number'],
+                    })
+
+        conflicts.sort(key=lambda x: x['score'], reverse=True)
+        return jsonify({'ok': True, 'clients_checked': len(clients),
+                        'cases_scanned': len(cases), 'conflicts': conflicts})
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+
+
 @app.route('/')
 def index():
     return PAGE
@@ -1284,6 +1390,17 @@ DATA_PAGE = """<!DOCTYPE html>
   .pager { display: flex; align-items: center; gap: 12px; margin-top: 12px; font-size: 13px; color: #8a8f98; }
   .pager button { background: #21262d; color: #e6e6e6; border: 1px solid #30363d; border-radius: 6px; padding: 5px 12px; cursor: pointer; }
   .pager button[disabled] { opacity: .4; cursor: default; }
+  .muted { color: #8a8f98; }
+  .ccheck { background: #1f6feb; color: #fff; border: 1px solid #388bfd; border-radius: 6px; padding: 5px 12px; font-size: 13px; cursor: pointer; margin-left: auto; }
+  .ccheck:hover { background: #388bfd; }
+  .ccheck[disabled] { opacity: .5; cursor: default; }
+  .conflicts { margin: 2px 0 14px; }
+  .conflicts h3 { font-size: 13px; margin: 0 0 8px; color: #e6e6e6; }
+  .cf-note { color: #8a8f98; font-style: italic; padding: 6px 0; }
+  .badge { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11px; font-weight: 600; white-space: nowrap; }
+  .badge.exact { background: rgba(248,81,73,.18); color: #f85149; border: 1px solid rgba(248,81,73,.4); }
+  .badge.review { background: rgba(210,153,34,.18); color: #d29922; border: 1px solid rgba(210,153,34,.4); }
+  .badge.adv { background: rgba(248,81,73,.18); color: #f85149; border: 1px solid rgba(248,81,73,.4); margin-left: 4px; }
 </style>
 </head>
 <body>
@@ -1369,7 +1486,9 @@ function renderBatches() {
         '<div class="cfilter">' +
           '<input id="f-subtype" placeholder="Filter case type&hellip;" value="' + esc(filterSubtype) + '" onchange="applyFilter()">' +
           '<input id="f-judgement" placeholder="Filter judgement&hellip;" value="' + esc(filterJudgement) + '" onchange="applyFilter()">' +
+          '<button class="ccheck" onclick="checkConflicts(' + b.id + ')">Check client conflicts</button>' +
         '</div>' +
+        '<div class="conflicts" id="conflicts-body-' + b.id + '"></div>' +
         '<div id="cases-body-' + b.id + '">Loading&hellip;</div></div>';
     }
     return '<div class="batch-item" id="bitem-' + b.id + '">' + head + detail + '</div>';
@@ -1474,6 +1593,43 @@ function exportBatch(id, fmt) {
 function changeBatchPage(delta) {
   batchPage = Math.max(0, batchPage + delta);
   loadCases();
+}
+function checkConflicts(id) {
+  var box = document.getElementById('conflicts-body-' + id);
+  if (!box) return;
+  var btn = document.querySelector('#detail-' + id + ' .ccheck');
+  if (btn) { btn.disabled = true; btn.textContent = 'Checking…'; }
+  box.innerHTML = '<div class="cf-note">Checking batch parties against the VPLC client list…</div>';
+  function done() { if (btn) { btn.disabled = false; btn.textContent = 'Check client conflicts'; } }
+  fetch('/api/batches/' + id + '/conflicts')
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      done();
+      if (!d.ok) { box.innerHTML = '<div class="cf-note">Error: ' + esc(d.error) + '</div>'; return; }
+      if (d.note) { box.innerHTML = '<div class="cf-note">' + esc(d.note) + '</div>'; return; }
+      var cf = d.conflicts || [];
+      if (!cf.length) {
+        box.innerHTML = '<div class="cf-note">No conflicts found &mdash; scanned ' + d.cases_scanned +
+          ' case(s) against ' + d.clients_checked + ' VPLC client(s).</div>';
+        return;
+      }
+      var rows = cf.map(function(x){
+        var badge = '<span class="badge ' + x.level + '">' + x.score + '% ' + x.level + '</span>';
+        var adv = x.client_adverse ? '<span class="badge adv">adverse</span>' : '';
+        var clientRole = x.client_role ? ' <span class="muted">(' + esc(x.client_role) + ')</span>' : '';
+        return '<tr>' +
+          '<td>' + badge + '</td>' +
+          cell(x.case_number) + cell(x.party_role) + cell(x.party_name) +
+          '<td title="' + esc(x.client_name) + '">' + esc(x.client_name) + clientRole + adv + '</td>' +
+          cell(x.elh_case_number) +
+          '</tr>';
+      }).join('');
+      box.innerHTML = '<h3>' + cf.length + ' potential conflict(s) &mdash; ' + d.cases_scanned +
+        ' cases vs ' + d.clients_checked + ' clients</h3>' +
+        '<table><tr><th>Match</th><th>Case number</th><th>Party role</th>' +
+        '<th>Party name</th><th>VPLC client</th><th>ELH case</th></tr>' + rows + '</table>';
+    })
+    .catch(function(e){ done(); box.innerHTML = '<div class="cf-note">Error: ' + e + '</div>'; });
 }
 loadBatches();
 setInterval(loadBatches, 10000);

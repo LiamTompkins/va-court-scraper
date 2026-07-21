@@ -3,6 +3,7 @@ boto
 boto3
 botocore
 certifi
+curl_cffi
 docutils
 Flask
 Flask-Login
@@ -21,6 +22,7 @@ psycopg2-binary
 pymongo
 python-dateutil
 python-Levenshtein
+rapidfuzz
 requests
 s3transfer
 selenium
