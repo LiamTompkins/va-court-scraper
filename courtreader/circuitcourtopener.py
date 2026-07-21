@@ -2,7 +2,6 @@ from __future__ import absolute_import
 import six.moves.urllib.request, six.moves.urllib.parse, six.moves.urllib.error
 from bs4 import BeautifulSoup
 import time
-import requests
 from .opener import Opener
 
 class CircuitCourtOpener:
@@ -31,33 +30,14 @@ class CircuitCourtOpener:
 
     def open_welcome_page(self):
         url = self.url('circuit.jsp')
-        session = requests.Session()
-        session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Upgrade-Insecure-Requests': '1',
-        })
-        # Visit the CJISWeb landing page first to establish a session, as a
-        # browser would, before requesting the circuit search page.
+        # Prime the session through the (browser-impersonating) opener itself, so
+        # every request - including the priming ones - carries a real Chrome TLS
+        # fingerprint and shares one cookie jar. Visit the CJISWeb landing page
+        # first, as a browser would, before the circuit search page.
         try:
-            session.get(self.url(''), timeout=60)
+            self.make_request(self.url(''))
         except Exception:
             pass
-        try:
-            session.get(url, timeout=60)
-        except Exception:
-            pass
-
-        try:
-            self.make_request(url)
-        except Exception:
-            pass
-        for name, value in session.cookies.items():
-            try:
-                self.opener.set_cookie(name, value)
-            except Exception:
-                pass
 
         try:
             content = self.make_request(url)
