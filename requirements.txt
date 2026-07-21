@@ -3,6 +3,7 @@ boto
 boto3
 botocore
 certifi
+curl_cffi
 docutils
 Flask
 Flask-Login
