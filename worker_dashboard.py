@@ -1545,7 +1545,13 @@ function fmtWhen(iso) {
 }
 var batchesById = {};
 var allBatches = [];
+// Restore the batch that was open before a reload so its cached conflict results
+// reappear when returning from the main dashboard.
 var currentBatch = null;
+try {
+  var _ob = localStorage.getItem('cc_open_batch');
+  if (_ob) { var _obn = parseInt(_ob, 10); if (!isNaN(_obn)) currentBatch = _obn; }
+} catch (e) {}
 var batchPage = 0;
 var filterSubtype = '';
 var filterJudgement = '';
@@ -1586,7 +1592,7 @@ function renderBatches() {
     });
     document.getElementById('meta').textContent =
       list.length + ' batch(es)' + (q ? ' matching "' + q + '"' : '');
-    if (currentBatch !== null) loadCases();
+    if (currentBatch !== null) { loadCases(); restoreConflicts(currentBatch); }
     return;
   }
   lastStructSig = structSig;
@@ -1615,7 +1621,7 @@ function renderBatches() {
   document.getElementById('batches').innerHTML = html ||
     '<div class="empty">' + (allBatches.length ? 'No batches match your search' : 'No task batches yet') + '</div>';
   document.getElementById('meta').textContent = list.length + ' batch(es)' + (q ? ' matching "' + q + '"' : '');
-  if (currentBatch !== null) loadCases();
+  if (currentBatch !== null) { loadCases(); restoreConflicts(currentBatch); }
 }
 function toggleBatch(id) {
   if (currentBatch === id) {
@@ -1626,6 +1632,7 @@ function toggleBatch(id) {
     filterSubtype = '';
     filterJudgement = '';
   }
+  try { localStorage.setItem('cc_open_batch', currentBatch === null ? '' : String(currentBatch)); } catch (e) {}
   renderBatches();
 }
 var sortCol = null;
@@ -1713,6 +1720,60 @@ function changeBatchPage(delta) {
   batchPage = Math.max(0, batchPage + delta);
   loadCases();
 }
+// Conflict results are cached in localStorage so they survive navigating to the
+// main dashboard and back (each is a full page load, which wipes in-memory state).
+var CONFLICT_STORE_KEY = 'cc_conflicts';
+function loadConflictCache() {
+  try { return JSON.parse(localStorage.getItem(CONFLICT_STORE_KEY) || '{}') || {}; }
+  catch (e) { return {}; }
+}
+function saveConflictResult(id, data) {
+  var c = loadConflictCache();
+  c[id] = { data: data, checkedAt: Date.now() };
+  try { localStorage.setItem(CONFLICT_STORE_KEY, JSON.stringify(c)); } catch (e) {}
+}
+function getConflictResult(id) {
+  return loadConflictCache()[id] || null;
+}
+function renderConflicts(id, d, checkedAt) {
+  var box = document.getElementById('conflicts-body-' + id);
+  if (!box) return;
+  if (!d.ok) { box.innerHTML = '<div class="cf-note">Error: ' + esc(d.error) + '</div>'; return; }
+  if (d.note) { box.innerHTML = '<div class="cf-note">' + esc(d.note) + '</div>'; return; }
+  var when = checkedAt ? ' &middot; checked ' + fmtWhen(new Date(checkedAt).toISOString()) : '';
+  var cf = d.conflicts || [];
+  if (!cf.length) {
+    box.innerHTML = '<div class="cf-note">No conflicts found &mdash; scanned ' + d.cases_scanned +
+      ' case(s) against ' + d.clients_checked + ' VPLC client(s).' + when + '</div>';
+    return;
+  }
+  var rows = cf.map(function(x){
+    var badge = '<span class="badge ' + x.level + '">' + x.score + '% ' + x.level + '</span>';
+    var adv = x.client_adverse ? '<span class="badge adv">adverse</span>' : '';
+    var clientRole = x.client_role ? ' <span class="muted">(' + esc(x.client_role) + ')</span>' : '';
+    return '<tr>' +
+      '<td>' + badge + '</td>' +
+      cell(x.case_number) + cell(x.party_role) + cell(x.party_name) +
+      '<td title="' + esc(x.client_name) + '">' + esc(x.client_name) + clientRole + adv + '</td>' +
+      cell(x.elh_case_number) +
+      '</tr>';
+  }).join('');
+  box.innerHTML = '<h3>' + cf.length + ' potential conflict(s) &mdash; ' + d.cases_scanned +
+    ' cases vs ' + d.clients_checked + ' clients' + when +
+    '<a class="export" style="margin-left:10px;" href="/api/batches/' + id + '/conflicts.xlsx">Download Excel</a>' +
+    '<a class="export" style="margin-left:6px;" href="/api/batches/' + id + '/conflicts.csv">Download CSV</a></h3>' +
+    '<table><tr><th>Match</th><th>Case number</th><th>Party role</th>' +
+    '<th>Party name</th><th>VPLC client</th><th>ELH case</th></tr>' + rows + '</table>';
+}
+// Re-render a batch's previously computed results (e.g. after a page reload),
+// but only when the panel isn't already showing this session's results.
+function restoreConflicts(id) {
+  if (id === null || id === undefined) return;
+  var box = document.getElementById('conflicts-body-' + id);
+  if (!box || box.innerHTML.trim() !== '') return;
+  var stored = getConflictResult(id);
+  if (stored) renderConflicts(id, stored.data, stored.checkedAt);
+}
 function checkConflicts(id) {
   var box = document.getElementById('conflicts-body-' + id);
   if (!box) return;
@@ -1724,31 +1785,8 @@ function checkConflicts(id) {
     .then(function(r){ return r.json(); })
     .then(function(d){
       done();
-      if (!d.ok) { box.innerHTML = '<div class="cf-note">Error: ' + esc(d.error) + '</div>'; return; }
-      if (d.note) { box.innerHTML = '<div class="cf-note">' + esc(d.note) + '</div>'; return; }
-      var cf = d.conflicts || [];
-      if (!cf.length) {
-        box.innerHTML = '<div class="cf-note">No conflicts found &mdash; scanned ' + d.cases_scanned +
-          ' case(s) against ' + d.clients_checked + ' VPLC client(s).</div>';
-        return;
-      }
-      var rows = cf.map(function(x){
-        var badge = '<span class="badge ' + x.level + '">' + x.score + '% ' + x.level + '</span>';
-        var adv = x.client_adverse ? '<span class="badge adv">adverse</span>' : '';
-        var clientRole = x.client_role ? ' <span class="muted">(' + esc(x.client_role) + ')</span>' : '';
-        return '<tr>' +
-          '<td>' + badge + '</td>' +
-          cell(x.case_number) + cell(x.party_role) + cell(x.party_name) +
-          '<td title="' + esc(x.client_name) + '">' + esc(x.client_name) + clientRole + adv + '</td>' +
-          cell(x.elh_case_number) +
-          '</tr>';
-      }).join('');
-      box.innerHTML = '<h3>' + cf.length + ' potential conflict(s) &mdash; ' + d.cases_scanned +
-        ' cases vs ' + d.clients_checked + ' clients' +
-        '<a class="export" style="margin-left:10px;" href="/api/batches/' + id + '/conflicts.xlsx">Download Excel</a>' +
-        '<a class="export" style="margin-left:6px;" href="/api/batches/' + id + '/conflicts.csv">Download CSV</a></h3>' +
-        '<table><tr><th>Match</th><th>Case number</th><th>Party role</th>' +
-        '<th>Party name</th><th>VPLC client</th><th>ELH case</th></tr>' + rows + '</table>';
+      if (d.ok) saveConflictResult(id, d);
+      renderConflicts(id, d, Date.now());
     })
     .catch(function(e){ done(); box.innerHTML = '<div class="cf-note">Error: ' + e + '</div>'; });
 }
