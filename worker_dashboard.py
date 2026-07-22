@@ -13,7 +13,7 @@ from sqlalchemy import create_engine, text
 STALE_THRESHOLD_SECONDS = 120
 # Seconds without a presence heartbeat before a worker process is treated as
 # gone and dropped from the dashboard.
-WORKER_STALE_SECONDS = 90
+WORKER_STALE_SECONDS = 60
 PORT = 5000
 
 app = Flask(__name__)
