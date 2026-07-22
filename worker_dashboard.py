@@ -17,7 +17,7 @@ from rapidfuzz import fuzz, process
 STALE_THRESHOLD_SECONDS = 120
 # Seconds without a presence heartbeat before a worker process is treated as
 # gone and dropped from the dashboard.
-WORKER_STALE_SECONDS = 90
+WORKER_STALE_SECONDS = 60
 PORT = 5000
 
 app = Flask(__name__)
@@ -851,12 +851,144 @@ def load_vplc_clients(conn):
     return clients
 
 
-def compute_batch_conflicts(conn, batch_id):
+def _make_conflict(occ, cl, score):
+    return {
+        'score': int(round(score)),
+        'level': 'exact' if score >= CONFLICT_EXACT_THRESHOLD else 'review',
+        'case_number': occ['case_number'], 'fips': occ['fips'],
+        'party_role': occ['role'], 'party_name': occ['name'],
+        'client_name': cl['display_name'], 'client_role': cl['role'],
+        'client_adverse': bool(cl['is_adverse']),
+        'elh_case_number': cl['elh_case_number'],
+        # Full Collected-Data case record, carried through to the exports so each
+        # flagged row keeps all of the case's fields.
+        'case': occ['case'],
+    }
+
+
+def _sql_name_key(col):
+    """SQL expression for the order-insensitive match key of a name column:
+    lowercase, keep alphanumeric tokens, sort them. Mirrors Python's
+    normalize_name + sorted tokens; COLLATE "C" keeps the token sort
+    deterministic so both sides of the join agree."""
+    return ("(SELECT string_agg(tok, ' ' ORDER BY tok COLLATE \"C\") "
+            "FROM regexp_split_to_table(lower(%s), '[^a-z0-9]+') AS tok "
+            "WHERE tok <> '')" % col)
+
+
+# Column order of the exact-match join SELECT, read positionally below.
+def _quick_conflict_from_row(r):
+    fips = str(r[1]).zfill(3)
+    return {
+        'score': 100, 'level': 'exact',
+        'case_number': r[0], 'fips': fips,
+        'party_role': r[11], 'party_name': r[12],
+        'client_name': r[13], 'client_role': r[14],
+        'client_adverse': bool(r[15]), 'elh_case_number': r[16],
+        'case': {
+            'case_number': r[0], 'fips': fips, 'case_type': r[2], 'case_id': r[3],
+            'case_subtype': r[4], 'judgement': r[5],
+            'case_date': r[6].isoformat() if r[6] else None,
+            'plaintiff': r[7], 'plaintiff_attorney': r[8],
+            'defendant': r[9], 'defendant_attorney': r[10],
+        },
+    }
+
+
+def compute_batch_conflicts_quick(conn, batch_id):
+    """Exact-match conflict check performed as a database join: the batch's case
+    parties are matched against pp_contact in SQL, so only matching rows come
+    back (the whole batch is never pulled into Python). Order-insensitive, so
+    court "LAST, FIRST" still matches PracticePanther "First Last"."""
+    batch = conn.execute(text(
+        'SELECT court_type, case_type FROM task_batches WHERE id = :b'
+    ), {'b': batch_id}).first()
+    src = CASE_SOURCES.get((batch[0], batch[1])) if batch else None
+
+    clients_checked = conn.execute(text(
+        "SELECT COUNT(*) FROM pp_contact WHERE display_name IS NOT NULL AND display_name <> ''"
+    )).scalar() or 0
+    cases_scanned = conn.execute(text(
+        'SELECT COUNT(*) FROM retrieved_cases WHERE batch_id = :b'
+    ), {'b': batch_id}).scalar() or 0
+
+    if not clients_checked:
+        return [], 0, cases_scanned, ("No VPLC (PracticePanther) contacts found in the shared "
+                                      "database. Run the conflict checker's PracticePanther sync first.")
+    if src is None:
+        # retrieved_cases carries no party names to match against.
+        return [], clients_checked, cases_scanned, None
+
+    # Aggregated party columns for the full case record (same shape the
+    # Collected-Data view and exports use).
+    if src.get('parties'):
+        p_tbl, d_tbl = src['parties']
+        def agg(tbl, col):
+            return ("(SELECT string_agg(z.\"%s\", '; ') FROM \"%s\" z WHERE z.case_id = c.id)"
+                    % (col, tbl))
+        col_plaintiff, col_plaint_att = agg(p_tbl, 'Name'), agg(p_tbl, 'Attorney')
+        col_defendant, col_def_att = agg(d_tbl, 'Name'), agg(d_tbl, 'Attorney')
+        # Civil parties live in per-party tables; match individual party rows.
+        arms = [('Plaintiff', p_tbl, 'Name'), ('Plaintiff attorney', p_tbl, 'Attorney'),
+                ('Defendant', d_tbl, 'Name'), ('Defendant attorney', d_tbl, 'Attorney')]
+        party_tables = True
+    else:
+        col_plaintiff = col_plaint_att = 'NULL'
+        col_defendant = 'c."%s"' % src['defendant']
+        col_def_att = 'c."%s"' % src['defendant_attorney']
+        arms = [('Defendant', None, src['defendant']),
+                ('Defendant attorney', None, src['defendant_attorney'])]
+        party_tables = False
+
+    caserec = ('rc.case_number, rc.fips, rc.case_type, c.id, c."%s", c."%s", c."%s", %s, %s, %s, %s'
+               % (src['subtype'], src['judgement'], src['date'],
+                  col_plaintiff, col_plaint_att, col_defendant, col_def_att))
+    base_join = ('FROM retrieved_cases rc JOIN "%s" c '
+                 'ON c.fips = rc.fips AND c."CaseNumber" = rc.case_number' % src['table'])
+    key_pp = _sql_name_key('pp.display_name')
+
+    # One UNION ALL arm per party role; each joins pp_contact on the match key so
+    # the database returns only matching (party, client) pairs. Table/column
+    # names come from CASE_SOURCES constants, not user input.
+    selects = []
+    for role, tbl, col in arms:
+        if party_tables:
+            name_expr = 'x."%s"' % col
+            join = base_join + (' JOIN "%s" x ON x.case_id = c.id' % tbl)
+        else:
+            name_expr = 'c."%s"' % col
+            join = base_join
+        key_party = _sql_name_key(name_expr)
+        # The join equality already excludes empty/NULL keys (a NULL key never
+        # equals another), so no extra guard is needed -- and adding one would
+        # push key computation onto a full scan of the case table.
+        selects.append(
+            "SELECT %s, '%s' AS party_role, %s AS party_name, "
+            "pp.display_name, pp.role, pp.is_adverse, pp.elh_case_number "
+            "%s JOIN pp_contact pp ON %s = %s "
+            "WHERE rc.batch_id = :b AND %s IS NOT NULL"
+            % (caserec, role, name_expr, join, key_party, key_pp, name_expr))
+
+    rows = conn.execute(text(' UNION ALL '.join(selects)), {'b': batch_id})
+    conflicts = [_quick_conflict_from_row(r) for r in rows]
+    conflicts.sort(key=lambda x: (x['case_number'] or '', x['party_role']))
+    return conflicts, clients_checked, cases_scanned, None
+
+
+def compute_batch_conflicts(conn, batch_id, quick=False):
     """Scan every party in a batch's cases against VPLC's PracticePanther client
-    list, flagging fuzzy name matches (potential conflicts of interest). Shared
-    by the JSON endpoint and the Excel export so they can't drift apart.
+    list, flagging name matches (potential conflicts of interest). Shared by the
+    JSON endpoint and the exports so they can't drift apart.
+
+    quick=True runs an exact, order-insensitive match as a single database join
+    (compute_batch_conflicts_quick) -- only matching rows leave the DB. quick=False
+    runs the fuzzy scan in Python, which also flags near matches for review.
+
     Returns (conflicts, clients_checked, cases_scanned, note); note is set (with
     conflicts empty) when there are no VPLC contacts to check against."""
+    if quick:
+        return compute_batch_conflicts_quick(conn, batch_id)
+
     clients = load_vplc_clients(conn)
     if not clients:
         return [], 0, 0, ("No VPLC (PracticePanther) contacts found in the shared "
@@ -890,19 +1022,7 @@ def compute_batch_conflicts(conn, batch_id):
             continue
         for occ in occ_list:
             for _matched, score, idx in matches:
-                cl = clients[idx]
-                conflicts.append({
-                    'score': int(round(score)),
-                    'level': 'exact' if score >= CONFLICT_EXACT_THRESHOLD else 'review',
-                    'case_number': occ['case_number'], 'fips': occ['fips'],
-                    'party_role': occ['role'], 'party_name': occ['name'],
-                    'client_name': cl['display_name'], 'client_role': cl['role'],
-                    'client_adverse': bool(cl['is_adverse']),
-                    'elh_case_number': cl['elh_case_number'],
-                    # Full Collected-Data case record, carried through to the
-                    # exports so each flagged row keeps all of the case's fields.
-                    'case': occ['case'],
-                })
+                conflicts.append(_make_conflict(occ, clients[idx], score))
 
     conflicts.sort(key=lambda x: x['score'], reverse=True)
     return conflicts, len(clients), len(cases), None
@@ -940,15 +1060,21 @@ def conflict_export_row(cf):
             [case.get(k) for k, _l in CASE_EXPORT_COLUMNS])
 
 
+def _quick_flag():
+    """Whether the request asked for the fast exact-match-only conflict check."""
+    return request.args.get('quick') in ('1', 'true', 'yes')
+
+
 @app.route('/api/batches/<int:batch_id>/conflicts')
 def batch_conflicts(batch_id):
+    quick = _quick_flag()
     try:
         with engine.connect() as conn:
             conflicts, clients_checked, cases_scanned, note = \
-                compute_batch_conflicts(conn, batch_id)
+                compute_batch_conflicts(conn, batch_id, quick=quick)
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
-    resp = {'ok': True, 'clients_checked': clients_checked,
+    resp = {'ok': True, 'quick': quick, 'clients_checked': clients_checked,
             'cases_scanned': cases_scanned, 'conflicts': conflicts}
     if note:
         resp['note'] = note
@@ -966,11 +1092,12 @@ def export_conflicts_xlsx(batch_id):
         return jsonify({'ok': False,
                         'error': 'openpyxl is not installed (pip install openpyxl)'}), 500
 
+    quick = _quick_flag()
     try:
         with engine.connect() as conn:
             batch = conn.execute(text(
                 'SELECT name FROM task_batches WHERE id = :b'), {'b': batch_id}).first()
-            conflicts, _clients, _cases, _note = compute_batch_conflicts(conn, batch_id)
+            conflicts, _clients, _cases, _note = compute_batch_conflicts(conn, batch_id, quick=quick)
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
 
@@ -997,21 +1124,23 @@ def export_conflicts_xlsx(batch_id):
     bio.seek(0)
     label = (batch[0] if batch and batch[0] else 'batch-%d' % batch_id)
     safe = re.sub(r'[^A-Za-z0-9._-]+', '-', label).strip('-') or ('batch-%d' % batch_id)
+    tag = 'quick-conflicts' if quick else 'conflicts'
     return Response(
         bio.getvalue(),
         mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        headers={'Content-Disposition': 'attachment; filename="%s-conflicts-%d.xlsx"' % (safe, batch_id)}
+        headers={'Content-Disposition': 'attachment; filename="%s-%s-%d.xlsx"' % (safe, tag, batch_id)}
     )
 
 
 @app.route('/api/batches/<int:batch_id>/conflicts.csv')
 def export_conflicts_csv(batch_id):
     """Download a batch's potential conflicts as CSV (opens directly in Excel)."""
+    quick = _quick_flag()
     try:
         with engine.connect() as conn:
             batch = conn.execute(text(
                 'SELECT name FROM task_batches WHERE id = :b'), {'b': batch_id}).first()
-            conflicts, _clients, _cases, _note = compute_batch_conflicts(conn, batch_id)
+            conflicts, _clients, _cases, _note = compute_batch_conflicts(conn, batch_id, quick=quick)
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
 
@@ -1023,10 +1152,11 @@ def export_conflicts_csv(batch_id):
 
     label = (batch[0] if batch and batch[0] else 'batch-%d' % batch_id)
     safe = re.sub(r'[^A-Za-z0-9._-]+', '-', label).strip('-') or ('batch-%d' % batch_id)
+    tag = 'quick-conflicts' if quick else 'conflicts'
     return Response(
         buf.getvalue(),
         mimetype='text/csv',
-        headers={'Content-Disposition': 'attachment; filename="%s-conflicts-%d.csv"' % (safe, batch_id)}
+        headers={'Content-Disposition': 'attachment; filename="%s-%s-%d.csv"' % (safe, tag, batch_id)}
     )
 
 
@@ -1524,6 +1654,8 @@ DATA_PAGE = """<!DOCTYPE html>
   .ccheck { background: #1f6feb; color: #fff; border: 1px solid #388bfd; border-radius: 6px; padding: 5px 12px; font-size: 13px; cursor: pointer; margin-left: auto; }
   .ccheck:hover { background: #388bfd; }
   .ccheck[disabled] { opacity: .5; cursor: default; }
+  .ccheck-quick { margin-left: 8px; background: #21262d; border-color: #30363d; }
+  .ccheck-quick:hover { background: #30363d; }
   .conflicts { margin: 2px 0 14px; }
   .conflicts h3 { font-size: 13px; margin: 0 0 8px; color: #e6e6e6; }
   .cf-note { color: #8a8f98; font-style: italic; padding: 6px 0; }
@@ -1622,7 +1754,8 @@ function renderBatches() {
         '<div class="cfilter">' +
           '<input id="f-subtype" placeholder="Filter case type&hellip;" value="' + esc(filterSubtype) + '" onchange="applyFilter()">' +
           '<input id="f-judgement" placeholder="Filter judgement&hellip;" value="' + esc(filterJudgement) + '" onchange="applyFilter()">' +
-          '<button class="ccheck" onclick="checkConflicts(' + b.id + ')">Check client conflicts</button>' +
+          '<button class="ccheck" onclick="checkConflicts(' + b.id + ', false)">Check client conflicts</button>' +
+          '<button class="ccheck ccheck-quick" onclick="checkConflicts(' + b.id + ', true)" title="Exact name matches only (no fuzzy scan) &mdash; faster">Quick check</button>' +
         '</div>' +
         '<div class="conflicts" id="conflicts-body-' + b.id + '"></div>' +
         '<div id="cases-body-' + b.id + '">Loading&hellip;</div></div>';
@@ -1752,10 +1885,12 @@ function renderConflicts(id, d, checkedAt) {
   if (!d.ok) { box.innerHTML = '<div class="cf-note">Error: ' + esc(d.error) + '</div>'; return; }
   if (d.note) { box.innerHTML = '<div class="cf-note">' + esc(d.note) + '</div>'; return; }
   var when = checkedAt ? ' &middot; checked ' + fmtWhen(new Date(checkedAt).toISOString()) : '';
+  var qp = d.quick ? '?quick=1' : '';
+  var modeLbl = d.quick ? ' <span class="muted">(quick &middot; exact only)</span>' : '';
   var cf = d.conflicts || [];
   if (!cf.length) {
     box.innerHTML = '<div class="cf-note">No conflicts found &mdash; scanned ' + d.cases_scanned +
-      ' case(s) against ' + d.clients_checked + ' VPLC client(s).' + when + '</div>';
+      ' case(s) against ' + d.clients_checked + ' VPLC client(s).' + when + modeLbl + '</div>';
     return;
   }
   var rows = cf.map(function(x){
@@ -1770,9 +1905,9 @@ function renderConflicts(id, d, checkedAt) {
       '</tr>';
   }).join('');
   box.innerHTML = '<h3>' + cf.length + ' potential conflict(s) &mdash; ' + d.cases_scanned +
-    ' cases vs ' + d.clients_checked + ' clients' + when +
-    '<a class="export" style="margin-left:10px;" href="/api/batches/' + id + '/conflicts.xlsx">Download Excel</a>' +
-    '<a class="export" style="margin-left:6px;" href="/api/batches/' + id + '/conflicts.csv">Download CSV</a></h3>' +
+    ' cases vs ' + d.clients_checked + ' clients' + when + modeLbl +
+    '<a class="export" style="margin-left:10px;" href="/api/batches/' + id + '/conflicts.xlsx' + qp + '">Download Excel</a>' +
+    '<a class="export" style="margin-left:6px;" href="/api/batches/' + id + '/conflicts.csv' + qp + '">Download CSV</a></h3>' +
     '<table><tr><th>Match</th><th>Case number</th><th>Party role</th>' +
     '<th>Party name</th><th>VPLC client</th><th>ELH case</th></tr>' + rows + '</table>';
 }
@@ -1785,14 +1920,15 @@ function restoreConflicts(id) {
   var stored = getConflictResult(id);
   if (stored) renderConflicts(id, stored.data, stored.checkedAt);
 }
-function checkConflicts(id) {
+function checkConflicts(id, quick) {
   var box = document.getElementById('conflicts-body-' + id);
   if (!box) return;
-  var btn = document.querySelector('#detail-' + id + ' .ccheck');
-  if (btn) { btn.disabled = true; btn.textContent = 'Checking…'; }
-  box.innerHTML = '<div class="cf-note">Checking batch parties against the VPLC client list…</div>';
-  function done() { if (btn) { btn.disabled = false; btn.textContent = 'Check client conflicts'; } }
-  fetch('/api/batches/' + id + '/conflicts')
+  var btns = document.querySelectorAll('#detail-' + id + ' .ccheck');
+  Array.prototype.forEach.call(btns, function(b){ b.disabled = true; });
+  box.innerHTML = '<div class="cf-note">' + (quick ? 'Quick-checking (exact names)' : 'Checking') +
+    ' batch parties against the VPLC client list…</div>';
+  function done() { Array.prototype.forEach.call(btns, function(b){ b.disabled = false; }); }
+  fetch('/api/batches/' + id + '/conflicts' + (quick ? '?quick=1' : ''))
     .then(function(r){ return r.json(); })
     .then(function(d){
       done();
