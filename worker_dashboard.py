@@ -534,13 +534,6 @@ def list_courts():
 
 
 BATCH_CASES_PER_PAGE = 50
-# Columns the Collected Data table can be sorted by. Whitelisted because the
-# name is interpolated into the ORDER BY; they match the select-list aliases.
-SORTABLE_CASE_COLUMNS = {
-    'case_id', 'case_number', 'case_type', 'case_subtype', 'judgement',
-    'fips', 'case_date', 'plaintiff', 'plaintiff_attorney',
-    'defendant', 'defendant_attorney',
-}
 
 
 @app.route('/api/batches')
@@ -646,8 +639,26 @@ def fetch_batch_cases(conn, batch_id, sort=None, direction='ASC', limit=None, of
     total = conn.execute(text(
         'SELECT COUNT(*) %s WHERE %s' % (join, where)), params).scalar() or 0
 
-    if sort in SORTABLE_CASE_COLUMNS:
-        order_by = '%s %s NULLS LAST, rc.id DESC' % (sort, direction)
+    # Map each sortable logical column to its real SQL expression. The logical
+    # names (case_id, judgement, plaintiff, ...) are not actual columns in the
+    # query, and some (fips) are ambiguous across the joined tables, so ordering
+    # by the bare name raises a SQL error - which the endpoint would swallow and
+    # render as "No cases recorded for this batch yet".
+    sort_exprs = {
+        'case_number': 'rc.case_number',
+        'fips': 'rc.fips',
+        'case_type': 'rc.case_type',
+        'case_id': 'c.id',
+        'case_subtype': 'c."%s"' % src['subtype'],
+        'judgement': 'c."%s"' % src['judgement'],
+        'case_date': 'c."%s"' % src['date'],
+        'plaintiff': plaintiff,
+        'plaintiff_attorney': plaintiff_att,
+        'defendant': defendant,
+        'defendant_attorney': defendant_att,
+    }
+    if sort in sort_exprs:
+        order_by = '%s %s NULLS LAST, rc.id DESC' % (sort_exprs[sort], direction)
     else:
         order_by = 'rc.collected_at DESC NULLS LAST, rc.id DESC'
 
