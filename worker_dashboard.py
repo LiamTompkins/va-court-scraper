@@ -10,10 +10,10 @@ import threading
 import webbrowser
 from datetime import datetime, timedelta
 
-from flask import Flask, jsonify, request, Response, redirect, url_for
+from flask import Flask, jsonify, request, Response, redirect, url_for, session
 from sqlalchemy import create_engine, text
 from rapidfuzz import fuzz, process
-from authlib.integrations.flask_client import OAuth
+from authlib.integrations.requests_client import OAuth2Session
 
 # Seconds without a heartbeat before an active task is considered stale.
 # Matches the threshold used by task_watchdog.py.
@@ -21,7 +21,9 @@ STALE_THRESHOLD_SECONDS = 120
 # Seconds without a presence heartbeat before a worker process is treated as
 # gone and dropped from the dashboard.
 WORKER_STALE_SECONDS = 60
-PORT = 5000
+# The OAuth redirect URL includes the port, and must match the one registered in
+# PracticePanther exactly, so allow overriding it.
+PORT = int(os.environ.get('DASHBOARD_PORT', '5000'))
 
 app = Flask(__name__)
 # Needed for the OAuth state stored in the session. Set DASHBOARD_SECRET_KEY to
@@ -29,35 +31,24 @@ app = Flask(__name__)
 app.secret_key = os.environ.get('DASHBOARD_SECRET_KEY') or secrets.token_urlsafe(32)
 engine = create_engine("postgresql://" + os.environ['POSTGRES_DB'])
 
-# PracticePanther OAuth. Credentials are optional -- the setup page reports them
-# as unconfigured rather than failing at import.
-PP_CLIENT_ID = os.environ.get('PP_CLIENT_ID', '')
-PP_CLIENT_SECRET = os.environ.get('PP_CLIENT_SECRET', '')
+# PracticePanther OAuth. Credentials come from the settings saved on the setup
+# page, falling back to the environment; the page reports them as unconfigured
+# rather than failing at import. Sessions are built per request so credentials
+# edited in the dashboard take effect without a restart.
+PP_CLIENT_ID_ENV = os.environ.get('PP_CLIENT_ID', '')
+PP_CLIENT_SECRET_ENV = os.environ.get('PP_CLIENT_SECRET', '')
 PP_AUTHORIZE_URL = 'https://app.practicepanther.com/OAuth/Authorize'
 PP_ACCESS_TOKEN_URL = 'https://app.practicepanther.com/OAuth/Token'
 PP_API_BASE = 'https://app.practicepanther.com/api/v2'
 
-
-def pp_fetch_token():
-    return pp_get_token()
-
-
-def pp_update_token(token, refresh_token=None, access_token=None):
-    pp_save_token(token)
-
-
-oauth = OAuth(app)
-oauth.register(
-    'pp',
-    client_id=PP_CLIENT_ID,
-    client_secret=PP_CLIENT_SECRET,
-    authorize_url=PP_AUTHORIZE_URL,
-    access_token_url=PP_ACCESS_TOKEN_URL,
-    fetch_token=pp_fetch_token,
-    update_token=pp_update_token,
-    # PracticePanther expects client credentials in the request body.
-    client_kwargs={'token_endpoint_auth_method': 'client_secret_post'},
-)
+# PracticePanther only accepts HTTPS redirect URLs, so the OAuth handshake needs
+# the dashboard served over TLS. DASHBOARD_SSL=1 runs it with a self-signed
+# ("adhoc") certificate. If PracticePanther still refuses the self-signed
+# localhost URL, put the dashboard behind a tunnel and set
+# DASHBOARD_EXTERNAL_URL to the tunnel's public https:// origin so the redirect
+# URL we send matches the one registered with them.
+DASHBOARD_SSL = os.environ.get('DASHBOARD_SSL', '').lower() in ('1', 'true', 'yes', 'adhoc')
+DASHBOARD_EXTERNAL_URL = os.environ.get('DASHBOARD_EXTERNAL_URL', '').rstrip('/')
 
 
 def ensure_schema():
@@ -86,6 +77,10 @@ def ensure_schema():
         ' first_name VARCHAR(64), last_name VARCHAR(64), role VARCHAR(64),'
         ' adverse VARCHAR(64), elh_case_number VARCHAR(64), updated_at VARCHAR(64),'
         ' is_adverse BOOLEAN, display_name VARCHAR(128))',
+        # Settings editable from the dashboard (e.g. the PracticePanther
+        # credentials), so they can be changed without editing the environment.
+        'CREATE TABLE IF NOT EXISTS app_settings ('
+        ' key VARCHAR(64) PRIMARY KEY, value TEXT, updated_at TIMESTAMP)',
     ]
     try:
         with engine.begin() as conn:
@@ -1209,6 +1204,63 @@ def export_conflicts_csv(batch_id):
 
 # ---------------------------------------------------------------- PracticePanther
 
+def get_setting(key, default=''):
+    """A value saved from the dashboard, or default if unset."""
+    try:
+        with engine.connect() as conn:
+            v = conn.execute(text('SELECT value FROM app_settings WHERE key = :k'),
+                             {'k': key}).scalar()
+    except Exception:
+        return default
+    return v if v not in (None, '') else default
+
+
+def set_setting(key, value):
+    with engine.begin() as conn:
+        conn.execute(text(
+            'INSERT INTO app_settings (key, value, updated_at) VALUES (:k, :v, :t) '
+            'ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, '
+            'updated_at = EXCLUDED.updated_at'),
+            {'k': key, 'v': value, 't': datetime.now()})
+
+
+def pp_credentials():
+    """(client_id, client_secret, source). Values saved on the setup page win
+    over the environment, so credentials can be changed without a restart."""
+    cid_db, sec_db = get_setting('pp_client_id'), get_setting('pp_client_secret')
+    cid = cid_db or PP_CLIENT_ID_ENV
+    sec = sec_db or PP_CLIENT_SECRET_ENV
+    source = {
+        'client_id': 'dashboard' if cid_db else ('environment' if PP_CLIENT_ID_ENV else None),
+        'client_secret': 'dashboard' if sec_db else ('environment' if PP_CLIENT_SECRET_ENV else None),
+    }
+    return cid, sec, source
+
+
+def pp_redirect_uri():
+    """The OAuth redirect URL, which must match the one registered in
+    PracticePanther character for character. DASHBOARD_EXTERNAL_URL overrides
+    the host we'd otherwise infer, for running behind a tunnel or proxy."""
+    if DASHBOARD_EXTERNAL_URL:
+        return DASHBOARD_EXTERNAL_URL + url_for('pp_authorize')
+    return url_for('pp_authorize', _external=True)
+
+
+def pp_session(with_token=True):
+    """An OAuth2 session built from the currently configured credentials. Built
+    per call so dashboard edits take effect immediately; the stored token is
+    refreshed automatically and written back."""
+    cid, sec, _ = pp_credentials()
+    return OAuth2Session(
+        client_id=cid, client_secret=sec,
+        token=pp_get_token() if with_token else None,
+        token_endpoint=PP_ACCESS_TOKEN_URL,
+        token_endpoint_auth_method='client_secret_post',
+        redirect_uri=pp_redirect_uri(),
+        update_token=lambda token, refresh_token=None, access_token=None: pp_save_token(token),
+    )
+
+
 def pp_get_token():
     """The stored PracticePanther OAuth token, or None. Shape matches what
     Authlib expects back from fetch_token."""
@@ -1269,7 +1321,7 @@ def pp_sync_contacts(full=False):
             if dt is not None:
                 updated_since = '?updated_since=' + (dt - timedelta(hours=12)).isoformat()
 
-    resp = oauth.pp.get(PP_API_BASE + '/accounts' + updated_since)
+    resp = pp_session().get(PP_API_BASE + '/accounts' + updated_since)
     if resp.status_code != 200:
         raise RuntimeError('PracticePanther API returned %s: %s'
                            % (resp.status_code, (resp.text or '')[:300]))
@@ -1311,11 +1363,17 @@ def pp_sync_contacts(full=False):
 
 @app.route('/api/pp/status')
 def pp_status():
-    redirect_uri = url_for('pp_authorize', _external=True)
+    redirect_uri = pp_redirect_uri()
+    cid, sec, source = pp_credentials()
     data = {
-        'configured': bool(PP_CLIENT_ID and PP_CLIENT_SECRET),
-        'client_id_set': bool(PP_CLIENT_ID),
-        'client_secret_set': bool(PP_CLIENT_SECRET),
+        'configured': bool(cid and sec),
+        'client_id_set': bool(cid),
+        'client_secret_set': bool(sec),
+        # The client id is not a secret, so it is echoed back to prefill the
+        # form. The secret never is -- only whether one is stored.
+        'client_id': cid,
+        'client_id_source': source['client_id'],
+        'client_secret_source': source['client_secret'],
         'redirect_uri': redirect_uri,
         # PracticePanther requires an HTTPS redirect URL when registering an app.
         'redirect_is_https': redirect_uri.lower().startswith('https://'),
@@ -1332,19 +1390,63 @@ def pp_status():
     return jsonify(data)
 
 
+@app.route('/api/pp/settings', methods=['POST'])
+def pp_save_settings():
+    """Save the PracticePanther credentials entered on the setup page. A blank
+    secret leaves the stored one untouched, so the id can be edited on its own."""
+    body = request.get_json(force=True, silent=True) or {}
+    client_id = (body.get('client_id') or '').strip()
+    client_secret = (body.get('client_secret') or '').strip()
+    try:
+        set_setting('pp_client_id', client_id)
+        if client_secret:
+            set_setting('pp_client_secret', client_secret)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+    cid, sec, _ = pp_credentials()
+    return jsonify({'ok': True, 'configured': bool(cid and sec),
+                    'secret_updated': bool(client_secret)})
+
+
+@app.route('/api/pp/settings/clear', methods=['POST'])
+def pp_clear_settings():
+    """Forget the dashboard-saved credentials (any environment values remain)."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("DELETE FROM app_settings WHERE key IN "
+                              "('pp_client_id', 'pp_client_secret')"))
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+    return jsonify({'ok': True})
+
+
 @app.route('/pp/login')
 def pp_login():
-    if not (PP_CLIENT_ID and PP_CLIENT_SECRET):
-        return Response('PP_CLIENT_ID and PP_CLIENT_SECRET must be set before connecting.',
+    cid, sec, _ = pp_credentials()
+    if not (cid and sec):
+        return Response('Set the PracticePanther client ID and secret before connecting.',
                         status=400, mimetype='text/plain')
-    return oauth.pp.authorize_redirect(url_for('pp_authorize', _external=True))
+    uri, state = pp_session(with_token=False).create_authorization_url(PP_AUTHORIZE_URL)
+    session['pp_oauth_state'] = state
+    return redirect(uri)
 
 
 @app.route('/pp/authorize')
 def pp_authorize():
     """OAuth callback: exchange the code for a token and store it."""
+    expected = session.pop('pp_oauth_state', None)
+    if not expected or request.args.get('state') != expected:
+        return Response('PracticePanther authorization failed: state mismatch. '
+                        'Start the connection again from the setup page.',
+                        status=400, mimetype='text/plain')
+    code = request.args.get('code')
+    if not code:
+        return Response('PracticePanther authorization failed: no code returned (%s).'
+                        % (request.args.get('error') or 'denied'),
+                        status=400, mimetype='text/plain')
     try:
-        token = oauth.pp.authorize_access_token()
+        token = pp_session(with_token=False).fetch_token(
+            PP_ACCESS_TOKEN_URL, code=code, grant_type='authorization_code')
         pp_save_token(token)
     except Exception as e:
         return Response('PracticePanther authorization failed: %s' % e,
@@ -2195,6 +2297,9 @@ PP_PAGE = """<!DOCTYPE html>
   .muted { color:#8a8f98; font-size:12.5px; }
   .msg { font-size:13px; color:#8a8f98; }
   ol { margin:6px 0 0 18px; padding:0; font-size:13px; color:#c9d1d9; line-height:1.7; }
+  .fld { display:flex; flex-direction:column; gap:4px; font-size:11px; color:#8a8f98; text-transform:uppercase; letter-spacing:.04em; }
+  .fld input { background:#0f1115; color:#e6e6e6; border:1px solid #30363d; border-radius:6px; padding:6px 9px; font-size:13px; min-width:300px; text-transform:none; letter-spacing:normal; }
+  .fld input:focus { outline:none; border-color:#388bfd; }
 </style>
 </head>
 <body>
@@ -2207,7 +2312,22 @@ PP_PAGE = """<!DOCTYPE html>
   <div class="step">
     <h2><span class="num">1</span>API credentials</h2>
     <div class="row" id="cred-row"></div>
-    <div class="muted">Set <code>PP_CLIENT_ID</code> and <code>PP_CLIENT_SECRET</code> in the dashboard's environment, then restart it.</div>
+    <div class="row">
+      <label class="fld">Client ID
+        <input type="text" id="client-id" placeholder="from PracticePanther" autocomplete="off" spellcheck="false">
+      </label>
+      <label class="fld">Client secret
+        <input type="password" id="client-secret" placeholder="paste the client secret" autocomplete="new-password" spellcheck="false">
+      </label>
+    </div>
+    <div class="row">
+      <button onclick="saveSettings()">Save credentials</button>
+      <button class="secondary" onclick="clearSettings()">Clear saved</button>
+      <span class="msg" id="cred-msg"></span>
+    </div>
+    <div class="muted">Saved in the shared database, so they survive restarts and take effect immediately.
+      The <code>PP_CLIENT_ID</code> / <code>PP_CLIENT_SECRET</code> environment variables are used as a
+      fallback when nothing is saved here.</div>
     <div class="row" style="margin-top:12px;"><span class="muted">Redirect URL to register in PracticePanther:</span></div>
     <div class="row"><code id="redirect-uri">&hellip;</code></div>
     <div id="https-warn"></div>
@@ -2242,17 +2362,51 @@ PP_PAGE = """<!DOCTYPE html>
 <script>
 function esc(v){ return v===null||v===undefined ? '' : String(v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function pill(cls, label){ return '<span class="pill ' + cls + '">' + label + '</span>'; }
+function src(s){ return s ? '<span class="muted">from ' + esc(s) + '</span>' : ''; }
+function saveSettings() {
+  var msg = document.getElementById('cred-msg');
+  msg.textContent = 'Saving…';
+  fetch('/api/pp/settings', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      client_id: document.getElementById('client-id').value,
+      client_secret: document.getElementById('client-secret').value
+    })
+  }).then(function(r){ return r.json(); }).then(function(d){
+    if (!d.ok) { msg.textContent = 'Error: ' + d.error; return; }
+    document.getElementById('client-secret').value = '';
+    msg.textContent = d.configured ? 'Saved.' : 'Saved — still missing a value.';
+    load();
+  }).catch(function(e){ msg.textContent = 'Error: ' + e; });
+}
+function clearSettings() {
+  if (!confirm('Forget the credentials saved in the dashboard?')) return;
+  fetch('/api/pp/settings/clear', { method: 'POST' }).then(function(){
+    document.getElementById('client-secret').value = '';
+    document.getElementById('cred-msg').textContent = 'Cleared.';
+    load();
+  });
+}
 function load() {
   fetch('/api/pp/status').then(function(r){ return r.json(); }).then(function(d){
     document.getElementById('meta').textContent = 'Updated ' + new Date().toLocaleTimeString();
     document.getElementById('cred-row').innerHTML =
-      pill(d.client_id_set ? 'ok' : 'bad', d.client_id_set ? 'Client ID set' : 'Client ID missing') + ' ' +
-      pill(d.client_secret_set ? 'ok' : 'bad', d.client_secret_set ? 'Client secret set' : 'Client secret missing');
+      pill(d.client_id_set ? 'ok' : 'bad', d.client_id_set ? 'Client ID set' : 'Client ID missing') +
+      src(d.client_id_source) + ' ' +
+      pill(d.client_secret_set ? 'ok' : 'bad', d.client_secret_set ? 'Client secret set' : 'Client secret missing') +
+      src(d.client_secret_source);
+    // Don't clobber what the user is typing.
+    var ci = document.getElementById('client-id');
+    if (document.activeElement !== ci) ci.value = d.client_id || '';
+    document.getElementById('client-secret').placeholder =
+      d.client_secret_set ? 'leave blank to keep current' : 'paste the client secret';
     document.getElementById('redirect-uri').textContent = d.redirect_uri;
     document.getElementById('https-warn').innerHTML = d.redirect_is_https ? '' :
       '<div class="row">' + pill('warn', 'HTTP') +
-      '<span class="muted">PracticePanther requires an HTTPS redirect URL when registering an app. ' +
-      'Run the dashboard over HTTPS (or through a tunnel) before connecting.</span></div>';
+      '<span class="muted">PracticePanther only accepts HTTPS redirect URLs, and rejects the ' +
+      'authorize request (400) when this does not match the URL registered on their app. ' +
+      'Restart the dashboard with <code>DASHBOARD_SSL=1</code> to serve HTTPS, or put it behind a ' +
+      'tunnel and set <code>DASHBOARD_EXTERNAL_URL</code> to the tunnel\\'s https origin.</span></div>';
 
     var conn = document.getElementById('conn-row');
     if (!d.connected) conn.innerHTML = pill('bad', 'Not connected');
@@ -2297,11 +2451,15 @@ setInterval(load, 15000);
 
 
 def open_browser():
-    webbrowser.open('http://127.0.0.1:%d/' % PORT)
+    webbrowser.open('%s://127.0.0.1:%d/' % ('https' if DASHBOARD_SSL else 'http', PORT))
 
 
 if __name__ == '__main__':
     # Open the browser shortly after the server starts. The reloader would
     # otherwise trigger this twice, so it is disabled.
     threading.Timer(1.0, open_browser).start()
-    app.run(host='127.0.0.1', port=PORT, debug=False, use_reloader=False)
+    if DASHBOARD_SSL:
+        print('Serving over HTTPS with a self-signed certificate '
+              '(your browser will warn once; proceed past it).')
+    app.run(host='127.0.0.1', port=PORT, debug=False, use_reloader=False,
+            ssl_context='adhoc' if DASHBOARD_SSL else None)
