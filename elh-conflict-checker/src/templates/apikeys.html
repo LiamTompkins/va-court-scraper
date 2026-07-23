@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container">
+    <h2 class="subtitle is-3 mt-6">API Keys</h2>
+
+    <table class="table is-fullwidth">
+        <thead>
+        <th>Name</th>
+        <th>Token</th>
+        <th></th>
+        </thead>
+        <tbody>
+            {% for api_user in api_users %}
+            <tr>
+                <td>{{ api_user.name }}</td>
+                <td>{{ api_user.token }}</td>
+                <td><button class="button is-small is-danger">Delete</button></td> 
+            </tr>
+            {% else %}
+            <div>No API Users</div>
+            {% endfor %}
+        </tbody>
+    </table>
+
+    <form method="POST" action="/apiuser">
+        <div class="field">
+            <div class="control">
+                <input class="input" type="text" name="name" placeholder="Name" autofocus="">
+            </div>
+        </div>
+        <button class="button is-block is-info">Create API Key</button>
+    </form>
+
+</div>
+{% endblock %}

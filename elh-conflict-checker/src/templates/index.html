@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="container">
+  <h1 class="title">ELH Conflict Checker</h1>
+
+  <h2 class="subtitle is-3 mt-6">Practice Panter</h2>
+
+  <div id="pp-connection-status" class="block">
+    {% if token is none %}
+      <div>Practice Panther connection has not been established</div>
+    {% elif token['expired'] %}
+      <div>Practice Panther connection has expired</div>
+    {% else %}
+      <div>Practice Panther connection is active</div>
+    {% endif %}
+  </div>
+
+  <div class="block">
+    <a id="pp-refresh" class="button is-success">Refresh Connection</a>
+    <a href="/pp/login" class="button is-info">Connect</a>
+  </div>
+
+  <h2 class="subtitle is-3 mt-6">Conflict Checks</h2>
+
+  <table id="conflicts-table" class="table is-fullwidth">
+      <thead>
+        <th>Time</th>
+        <th>Case ID</th>
+        <th>Contacts</th>
+        <th>Conflicts</th>
+        <th>Conflict Type</th>
+        <th>PP Contacts Created</th>
+        <th>PP Contacts Updated</th>
+        <th>Error</th>
+      </thead>
+      <tbody>
+          {% for cc in conflict_checks %}
+          <tr onclick='printRequestReponse("{{ cc.request_text }}", "{{ cc.response_text }}")'>
+              <td>{{ cc.time }}</td>
+              <td>{{ cc.case_id }}</td>
+              <td>{{ cc.contact_count }}</td>
+              <td>{{ cc.conflict_count }}</td>
+              <td>{{ cc.conflict_type }}</td>
+              <td>{{ cc.pp_contacts_created }}</td>
+              <td>{{ cc.pp_contacts_updated }}</td>
+              <td>{{ cc.error }}</td>
+          </tr>
+          {% endfor %}
+      </tbody>
+  </table>
+
+</div>
+
+<script>
+  function printRequestReponse(request, response) {
+    console.log(request);
+    console.log(response);
+  }
+
+  $(document).ready(function() {
+    $('#conflicts-table').DataTable({
+      "order": [[ 0, "desc" ]]
+    });
+
+    $('#pp-refresh').click(function() {
+      $.get('/pp/refresh')
+        .done(function(data) {
+          $('#pp-connection-status').html("Practice Panther connection is active... found " + data.contacts + " contacts");
+        });
+    });
+  });
+</script>
+{% endblock %}
