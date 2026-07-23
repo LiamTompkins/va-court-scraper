@@ -4,13 +4,16 @@ import os
 import io
 import re
 import csv
+import time
+import secrets
 import threading
 import webbrowser
 from datetime import datetime, timedelta
 
-from flask import Flask, jsonify, request, Response
+from flask import Flask, jsonify, request, Response, redirect, url_for
 from sqlalchemy import create_engine, text
 from rapidfuzz import fuzz, process
+from authlib.integrations.flask_client import OAuth
 
 # Seconds without a heartbeat before an active task is considered stale.
 # Matches the threshold used by task_watchdog.py.
@@ -21,7 +24,40 @@ WORKER_STALE_SECONDS = 60
 PORT = 5000
 
 app = Flask(__name__)
+# Needed for the OAuth state stored in the session. Set DASHBOARD_SECRET_KEY to
+# keep sessions valid across restarts; otherwise a fresh key is generated.
+app.secret_key = os.environ.get('DASHBOARD_SECRET_KEY') or secrets.token_urlsafe(32)
 engine = create_engine("postgresql://" + os.environ['POSTGRES_DB'])
+
+# PracticePanther OAuth. Credentials are optional -- the setup page reports them
+# as unconfigured rather than failing at import.
+PP_CLIENT_ID = os.environ.get('PP_CLIENT_ID', '')
+PP_CLIENT_SECRET = os.environ.get('PP_CLIENT_SECRET', '')
+PP_AUTHORIZE_URL = 'https://app.practicepanther.com/OAuth/Authorize'
+PP_ACCESS_TOKEN_URL = 'https://app.practicepanther.com/OAuth/Token'
+PP_API_BASE = 'https://app.practicepanther.com/api/v2'
+
+
+def pp_fetch_token():
+    return pp_get_token()
+
+
+def pp_update_token(token, refresh_token=None, access_token=None):
+    pp_save_token(token)
+
+
+oauth = OAuth(app)
+oauth.register(
+    'pp',
+    client_id=PP_CLIENT_ID,
+    client_secret=PP_CLIENT_SECRET,
+    authorize_url=PP_AUTHORIZE_URL,
+    access_token_url=PP_ACCESS_TOKEN_URL,
+    fetch_token=pp_fetch_token,
+    update_token=pp_update_token,
+    # PracticePanther expects client credentials in the request body.
+    client_kwargs={'token_endpoint_auth_method': 'client_secret_post'},
+)
 
 
 def ensure_schema():
@@ -39,6 +75,17 @@ def ensure_schema():
         'CREATE TABLE IF NOT EXISTS retrieved_cases ('
         ' id BIGSERIAL PRIMARY KEY, batch_id INTEGER, court_type VARCHAR,'
         ' case_type VARCHAR, fips INTEGER, case_number VARCHAR, collected_at TIMESTAMP)',
+        # Shared with elh-conflict-checker (same columns its models declare), so
+        # the PracticePanther setup page works even before that app has run.
+        'CREATE TABLE IF NOT EXISTS pp_tokens ('
+        ' id SERIAL PRIMARY KEY, access_token VARCHAR(1000) NOT NULL,'
+        ' refresh_token VARCHAR(255), issued_at INTEGER NOT NULL DEFAULT 0,'
+        ' expires_in INTEGER NOT NULL DEFAULT 0, expires_at INTEGER NOT NULL DEFAULT 0)',
+        'CREATE TABLE IF NOT EXISTS pp_contact ('
+        ' id SERIAL PRIMARY KEY, account_id VARCHAR(64), contact_id VARCHAR(64),'
+        ' first_name VARCHAR(64), last_name VARCHAR(64), role VARCHAR(64),'
+        ' adverse VARCHAR(64), elh_case_number VARCHAR(64), updated_at VARCHAR(64),'
+        ' is_adverse BOOLEAN, display_name VARCHAR(128))',
     ]
     try:
         with engine.begin() as conn:
@@ -1160,6 +1207,180 @@ def export_conflicts_csv(batch_id):
     )
 
 
+# ---------------------------------------------------------------- PracticePanther
+
+def pp_get_token():
+    """The stored PracticePanther OAuth token, or None. Shape matches what
+    Authlib expects back from fetch_token."""
+    try:
+        with engine.connect() as conn:
+            r = conn.execute(text(
+                'SELECT access_token, refresh_token, issued_at, expires_in, expires_at '
+                'FROM pp_tokens ORDER BY id DESC LIMIT 1')).first()
+    except Exception:
+        return None
+    if not r:
+        return None
+    return {'access_token': r[0], 'refresh_token': r[1], 'issued_at': r[2] or 0,
+            'expires_in': r[3] or 0, 'expires_at': r[4] or 0, 'token_type': 'Bearer'}
+
+
+def pp_save_token(token):
+    """Replace the stored token (only one is kept, like the conflict checker)."""
+    with engine.begin() as conn:
+        conn.execute(text('DELETE FROM pp_tokens'))
+        conn.execute(text(
+            'INSERT INTO pp_tokens (access_token, refresh_token, issued_at, expires_in, expires_at) '
+            'VALUES (:a, :r, :i, :ei, :ea)'),
+            {'a': token.get('access_token'), 'r': token.get('refresh_token'),
+             'i': int(time.time()), 'ei': int(token.get('expires_in') or 0),
+             'ea': int(token.get('expires_at') or 0)})
+
+
+def pp_token_status():
+    tok = pp_get_token()
+    if not tok:
+        return {'connected': False, 'expired': None, 'expires_at': None}
+    expired = (tok['issued_at'] + tok['expires_in']) < time.time()
+    return {'connected': True, 'expired': expired,
+            'expires_at': tok['issued_at'] + tok['expires_in']}
+
+
+def pp_sync_contacts(full=False):
+    """Download PracticePanther accounts into the shared pp_contact table, which
+    the batch conflict check reads. full=True clears the cache and refetches
+    everything; otherwise only accounts updated since the newest cached one are
+    pulled (with a 12h overlap, matching the conflict checker)."""
+    updated_since = ''
+    if full:
+        with engine.begin() as conn:
+            conn.execute(text('DELETE FROM pp_contact'))
+    else:
+        with engine.connect() as conn:
+            latest = conn.execute(text('SELECT MAX(updated_at) FROM pp_contact')).scalar()
+        if latest:
+            dt = None
+            for fmt in ('%Y-%m-%dT%H:%M:%S.%f', '%Y-%m-%dT%H:%M:%S'):
+                try:
+                    dt = datetime.strptime(latest, fmt)
+                    break
+                except ValueError:
+                    continue
+            if dt is not None:
+                updated_since = '?updated_since=' + (dt - timedelta(hours=12)).isoformat()
+
+    resp = oauth.pp.get(PP_API_BASE + '/accounts' + updated_since)
+    if resp.status_code != 200:
+        raise RuntimeError('PracticePanther API returned %s: %s'
+                           % (resp.status_code, (resp.text or '')[:300]))
+    accounts = resp.json()
+
+    adverse_values = ['yes', 'true', 'adverse to client']
+    written = 0
+    with engine.begin() as conn:
+        for a in accounts:
+            pc = a.get('primary_contact') or {}
+            role = adverse = elh = None
+            for cf in (pc.get('custom_field_values') or []):
+                label = (cf.get('custom_field_ref') or {}).get('label')
+                val = cf.get('value_string')
+                if val is None:
+                    continue
+                if label == 'Role':
+                    role = val
+                elif label == 'Conflict Check':
+                    adverse = val.lower()
+                elif label == 'ELH Case Number':
+                    elh = val
+            first = pc.get('first_name') or ''
+            last = pc.get('last_name') or ''
+            # Refresh in place so re-syncing doesn't duplicate an account.
+            conn.execute(text('DELETE FROM pp_contact WHERE account_id = :aid'),
+                         {'aid': a.get('id')})
+            conn.execute(text(
+                'INSERT INTO pp_contact (account_id, contact_id, first_name, last_name, role,'
+                ' adverse, elh_case_number, updated_at, is_adverse, display_name) '
+                'VALUES (:aid, :cid, :fn, :ln, :role, :adv, :elh, :upd, :isadv, :disp)'),
+                {'aid': a.get('id'), 'cid': pc.get('id'), 'fn': pc.get('first_name'),
+                 'ln': pc.get('last_name'), 'role': role, 'adv': adverse, 'elh': elh,
+                 'upd': a.get('updated_at'), 'isadv': adverse in adverse_values,
+                 'disp': (first + ' ' + last).strip()})
+            written += 1
+    return written
+
+
+@app.route('/api/pp/status')
+def pp_status():
+    redirect_uri = url_for('pp_authorize', _external=True)
+    data = {
+        'configured': bool(PP_CLIENT_ID and PP_CLIENT_SECRET),
+        'client_id_set': bool(PP_CLIENT_ID),
+        'client_secret_set': bool(PP_CLIENT_SECRET),
+        'redirect_uri': redirect_uri,
+        # PracticePanther requires an HTTPS redirect URL when registering an app.
+        'redirect_is_https': redirect_uri.lower().startswith('https://'),
+        'contacts': 0, 'last_contact_update': None,
+    }
+    data.update(pp_token_status())
+    try:
+        with engine.connect() as conn:
+            data['contacts'] = conn.execute(text('SELECT COUNT(*) FROM pp_contact')).scalar() or 0
+            data['last_contact_update'] = conn.execute(
+                text('SELECT MAX(updated_at) FROM pp_contact')).scalar()
+    except Exception:
+        pass
+    return jsonify(data)
+
+
+@app.route('/pp/login')
+def pp_login():
+    if not (PP_CLIENT_ID and PP_CLIENT_SECRET):
+        return Response('PP_CLIENT_ID and PP_CLIENT_SECRET must be set before connecting.',
+                        status=400, mimetype='text/plain')
+    return oauth.pp.authorize_redirect(url_for('pp_authorize', _external=True))
+
+
+@app.route('/pp/authorize')
+def pp_authorize():
+    """OAuth callback: exchange the code for a token and store it."""
+    try:
+        token = oauth.pp.authorize_access_token()
+        pp_save_token(token)
+    except Exception as e:
+        return Response('PracticePanther authorization failed: %s' % e,
+                        status=400, mimetype='text/plain')
+    return redirect(url_for('pp_page'))
+
+
+@app.route('/api/pp/disconnect', methods=['POST'])
+def pp_disconnect():
+    try:
+        with engine.begin() as conn:
+            conn.execute(text('DELETE FROM pp_tokens'))
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+    return jsonify({'ok': True})
+
+
+@app.route('/api/pp/sync', methods=['POST'])
+def pp_sync():
+    if not pp_get_token():
+        return jsonify({'ok': False, 'error': 'Not connected to PracticePanther yet.'}), 400
+    full = request.args.get('full') in ('1', 'true', 'yes')
+    try:
+        written = pp_sync_contacts(full=full)
+    except Exception as e:
+        return jsonify({'ok': False, 'error': str(e)}), 500
+    with engine.connect() as conn:
+        total = conn.execute(text('SELECT COUNT(*) FROM pp_contact')).scalar() or 0
+    return jsonify({'ok': True, 'fetched': written, 'contacts': total, 'full': full})
+
+
+@app.route('/pp')
+def pp_page():
+    return PP_PAGE
+
+
 @app.route('/')
 def index():
     return PAGE
@@ -1251,6 +1472,7 @@ PAGE = """<!DOCTYPE html>
     <h1>Virginia Court Scraper &mdash; Worker Dashboard</h1>
     <span>
       <a class="logs-btn" href="/data" style="text-decoration:none;">Collected data</a>
+      <a class="logs-btn" href="/pp" style="text-decoration:none;">PracticePanther</a>
       <button class="logs-btn" onclick="openLogs()">Worker logs</button>
     </span>
   </div>
@@ -1939,6 +2161,136 @@ function checkConflicts(id, quick) {
 }
 loadBatches();
 setInterval(loadBatches, 10000);
+</script>
+</body>
+</html>"""
+
+
+PP_PAGE = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>VA Court Scraper - PracticePanther Setup</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; background: #0f1115; color: #e6e6e6; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  h2 { font-size: 15px; margin: 0 0 10px; }
+  .top { display: flex; align-items: center; justify-content: space-between; }
+  .link { background: #21262d; color: #e6e6e6; border: 1px solid #30363d; border-radius: 6px; padding: 6px 12px; text-decoration: none; font-size: 13px; }
+  .link:hover { background: #30363d; }
+  .meta { color: #8a8f98; font-size: 13px; margin-bottom: 20px; }
+  .step { background: #171a21; border: 1px solid #262b36; border-radius: 8px; padding: 16px; margin-bottom: 16px; max-width: 900px; }
+  .num { display:inline-block; width:22px; height:22px; line-height:22px; text-align:center; border-radius:50%; background:#21262d; color:#8a8f98; font-size:12px; margin-right:8px; }
+  .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 8px 0; }
+  .pill { display:inline-block; padding:2px 9px; border-radius:10px; font-size:12px; font-weight:600; }
+  .pill.ok { background: rgba(63,185,80,.18); color:#3fb950; border:1px solid rgba(63,185,80,.4); }
+  .pill.bad { background: rgba(248,81,73,.18); color:#f85149; border:1px solid rgba(248,81,73,.4); }
+  .pill.warn { background: rgba(210,153,34,.18); color:#d29922; border:1px solid rgba(210,153,34,.4); }
+  button, a.btn { background:#1f6feb; color:#fff; border:1px solid #388bfd; border-radius:6px; padding:6px 14px; font-size:13px; cursor:pointer; text-decoration:none; display:inline-block; }
+  button:hover, a.btn:hover { background:#388bfd; }
+  button.secondary { background:#21262d; border-color:#30363d; }
+  button.secondary:hover { background:#30363d; }
+  button[disabled] { opacity:.5; cursor:default; }
+  code { background:#0f1115; border:1px solid #30363d; border-radius:5px; padding:2px 7px; font-family: ui-monospace, Consolas, monospace; font-size:12px; word-break:break-all; }
+  .muted { color:#8a8f98; font-size:12.5px; }
+  .msg { font-size:13px; color:#8a8f98; }
+  ol { margin:6px 0 0 18px; padding:0; font-size:13px; color:#c9d1d9; line-height:1.7; }
+</style>
+</head>
+<body>
+  <div class="top">
+    <h1>PracticePanther Setup</h1>
+    <a class="link" href="/">&larr; Dashboard</a>
+  </div>
+  <div class="meta" id="meta">Loading&hellip;</div>
+
+  <div class="step">
+    <h2><span class="num">1</span>API credentials</h2>
+    <div class="row" id="cred-row"></div>
+    <div class="muted">Set <code>PP_CLIENT_ID</code> and <code>PP_CLIENT_SECRET</code> in the dashboard's environment, then restart it.</div>
+    <div class="row" style="margin-top:12px;"><span class="muted">Redirect URL to register in PracticePanther:</span></div>
+    <div class="row"><code id="redirect-uri">&hellip;</code></div>
+    <div id="https-warn"></div>
+    <ol>
+      <li>In PracticePanther, click <b>Support &rarr; Ask us Anything</b> and request API access (granted case by case).</li>
+      <li>Once approved, go to <b>Integrations &rarr; API &rarr; New App</b>.</li>
+      <li>Paste the redirect URL above into the app, then copy its Client ID and Secret into the two environment variables.</li>
+    </ol>
+  </div>
+
+  <div class="step">
+    <h2><span class="num">2</span>Connection</h2>
+    <div class="row" id="conn-row"></div>
+    <div class="row">
+      <a class="btn" id="connect-btn" href="/pp/login">Connect to PracticePanther</a>
+      <button class="secondary" id="disconnect-btn" onclick="disconnect()">Disconnect</button>
+    </div>
+    <div class="muted">Authorizing sends you to PracticePanther and back. The token is stored in the shared database and refreshed automatically.</div>
+  </div>
+
+  <div class="step">
+    <h2><span class="num">3</span>Client contacts</h2>
+    <div class="row" id="sync-row"></div>
+    <div class="row">
+      <button id="sync-btn" onclick="sync(false)">Sync new/updated</button>
+      <button class="secondary" id="full-btn" onclick="sync(true)">Full resync</button>
+      <span class="msg" id="sync-msg"></span>
+    </div>
+    <div class="muted">Contacts land in the shared <code>pp_contact</code> table &mdash; the same list the batch conflict check matches against.</div>
+  </div>
+
+<script>
+function esc(v){ return v===null||v===undefined ? '' : String(v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function pill(cls, label){ return '<span class="pill ' + cls + '">' + label + '</span>'; }
+function load() {
+  fetch('/api/pp/status').then(function(r){ return r.json(); }).then(function(d){
+    document.getElementById('meta').textContent = 'Updated ' + new Date().toLocaleTimeString();
+    document.getElementById('cred-row').innerHTML =
+      pill(d.client_id_set ? 'ok' : 'bad', d.client_id_set ? 'Client ID set' : 'Client ID missing') + ' ' +
+      pill(d.client_secret_set ? 'ok' : 'bad', d.client_secret_set ? 'Client secret set' : 'Client secret missing');
+    document.getElementById('redirect-uri').textContent = d.redirect_uri;
+    document.getElementById('https-warn').innerHTML = d.redirect_is_https ? '' :
+      '<div class="row">' + pill('warn', 'HTTP') +
+      '<span class="muted">PracticePanther requires an HTTPS redirect URL when registering an app. ' +
+      'Run the dashboard over HTTPS (or through a tunnel) before connecting.</span></div>';
+
+    var conn = document.getElementById('conn-row');
+    if (!d.connected) conn.innerHTML = pill('bad', 'Not connected');
+    else if (d.expired) conn.innerHTML = pill('warn', 'Token expired') +
+      '<span class="muted">Syncing will refresh it automatically, or reconnect.</span>';
+    else conn.innerHTML = pill('ok', 'Connected') + '<span class="muted">Expires ' +
+      (d.expires_at ? new Date(d.expires_at * 1000).toLocaleString() : 'unknown') + '</span>';
+    var cbtn = document.getElementById('connect-btn');
+    cbtn.textContent = d.connected ? 'Reconnect' : 'Connect to PracticePanther';
+    cbtn.style.opacity = d.configured ? 1 : .5;
+    document.getElementById('disconnect-btn').disabled = !d.connected;
+
+    document.getElementById('sync-row').innerHTML =
+      pill(d.contacts ? 'ok' : 'warn', d.contacts + ' contacts cached') +
+      (d.last_contact_update ? '<span class="muted">newest record ' + esc(d.last_contact_update) + '</span>' : '');
+    document.getElementById('sync-btn').disabled = !d.connected;
+    document.getElementById('full-btn').disabled = !d.connected;
+  }).catch(function(e){ document.getElementById('meta').textContent = 'Error: ' + e; });
+}
+function sync(full) {
+  var msg = document.getElementById('sync-msg');
+  var a = document.getElementById('sync-btn'), b = document.getElementById('full-btn');
+  a.disabled = true; b.disabled = true;
+  msg.textContent = full ? 'Full resync running…' : 'Syncing…';
+  fetch('/api/pp/sync' + (full ? '?full=1' : ''), { method: 'POST' })
+    .then(function(r){ return r.json(); }).then(function(d){
+      msg.textContent = d.ok
+        ? ('Fetched ' + d.fetched + ' account(s) — ' + d.contacts + ' contacts cached.')
+        : ('Error: ' + d.error);
+      load();
+    }).catch(function(e){ msg.textContent = 'Error: ' + e; a.disabled = false; b.disabled = false; });
+}
+function disconnect() {
+  if (!confirm('Remove the stored PracticePanther token?')) return;
+  fetch('/api/pp/disconnect', { method: 'POST' }).then(function(){ load(); });
+}
+load();
+setInterval(load, 15000);
 </script>
 </body>
 </html>"""
