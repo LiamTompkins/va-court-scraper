@@ -99,34 +99,35 @@ The **Worker logs** button at the top opens a viewer for those `worker_logs/` fi
 
 ## PracticePanther conflict checking
 
-The dashboard can check a batch of collected cases for conflicts of interest against VPLC's client list in [PracticePanther](https://www.practicepanther.com/), and the whole PracticePanther setup can be done from the dashboard itself. This shares a database with, and reuses the contact list synced by, the [elh-conflict-checker](elh-conflict-checker/) app (a copy of which is vendored in this repo).
+The dashboard can check a batch of collected cases for conflicts of interest against VPLC's client list in [PracticePanther](https://www.practicepanther.com/). The actual PracticePanther connection is handled by the separate [elh-conflict-checker](elh-conflict-checker/) app (a copy is vendored in this repo); the dashboard is a setup hub that shares its database. The dashboard reads the contact list (`pp_contact`) that the conflict checker syncs, and matches batch case parties against it.
 
 This needs `Authlib`, which is listed in `requirements.txt`.
 
+### Running both together
+
+The dashboard's **Connect** button opens the conflict checker's sign-in page, so both apps need to be running against the same database. `launch.py` starts them together and shuts both down on Ctrl+C:
+
+        $env:POSTGRES_DB="<user>:<pass>@<host>:5432/<db>"; python launch.py
+
+It runs the dashboard (port 5000) and the conflict checker (port 5001, adhoc HTTPS), passing the shared database to each. `python launch.py --check` prints the resolved configuration without starting anything. Useful environment variables:
+
+- `POSTGRES_DB` - shared database as `user:pass@host:port/dbname` (required).
+- `SECRET_KEY` - conflict checker session secret (generated if unset).
+- `DASHBOARD_PORT` / `CONFLICT_CHECKER_PORT` - defaults 5000 / 5001.
+- `CONFLICT_CHECKER_DIR` - path to the conflict checker repo (default `../../elh-conflict-checker`); `CONFLICT_CHECKER_PYTHON` / `DASHBOARD_PYTHON` override the interpreters.
+
+To run them separately instead, start the conflict checker with `python -m flask run --cert=adhoc --host=127.0.0.1 --port=5001` (from its directory, with `SECRET_KEY` and `DATABASE_URL` set) and the dashboard with `python worker_dashboard.py`; set `CONFLICT_CHECKER_URL` on the dashboard if the checker isn't at `https://127.0.0.1:5001`.
+
 ### Setup (the PracticePanther page)
 
-Open the **PracticePanther** link in the dashboard's top nav (or go to `/pp`). The page walks through three steps:
+Open the **PracticePanther** link in the dashboard's top nav (or go to `/pp`). Enter the four setup values and Save:
 
-1. **API credentials.** PracticePanther grants API access case by case - in PracticePanther, click **Support -> Ask us Anything** and request it, then once approved go to **Integrations -> API -> New App**. Enter the **Client ID** and **Client secret** into the form on the page (they are saved in the database and take effect immediately, no restart needed) and register the **redirect URL** the page displays. The `PP_CLIENT_ID` / `PP_CLIENT_SECRET` environment variables are used as a fallback when nothing is saved on the page.
-2. **Connection.** Click **Connect** to authorize with PracticePanther. The token is stored in the shared database and refreshed automatically.
-3. **Client contacts.** Sync PracticePanther accounts into the shared `pp_contact` table - the list the conflict check matches against. Use **Sync new/updated** for a quick incremental pull or **Full resync** to rebuild the cache.
+1. **PracticePanther Client ID and Client secret.** PracticePanther grants API access case by case - click **Support -> Ask us Anything** and request it, then once approved go to **Integrations -> API -> New App**. These are saved in the shared database and read by the conflict checker (the `PP_CLIENT_ID` / `PP_CLIENT_SECRET` environment variables are a fallback).
+2. **Login email and password.** These create the conflict checker's sign-in account (stored in the shared `user` table).
 
-**PracticePanther only accepts HTTPS redirect URLs** and rejects the authorize request with a `400 Bad Request` when the redirect it receives does not match the one registered on your app. So the dashboard must be served over HTTPS for the connection step, and the port in the redirect URL must match. Start it like this (PowerShell):
+Then click **Connect**. It opens the conflict checker's sign-in page; log in with the email/password above, and do the PracticePanther authorization there. The conflict checker uses the client id/secret you saved, and stores the token in the shared database. Back on the dashboard, that token drives the **Client contacts** sync into the shared `pp_contact` table (the list the conflict check matches against).
 
-        $env:DASHBOARD_SSL="1"; python worker_dashboard.py
-
-Relevant environment variables:
-
-- `DASHBOARD_SSL=1` - serve the dashboard over HTTPS.
-- `DASHBOARD_PORT=<port>` - change the port (defaults to 5000); the redirect URL includes it, so it must match what is registered in PracticePanther.
-- `DASHBOARD_EXTERNAL_URL=https://...` - use this exact origin in the redirect URL instead of the inferred host, for running behind a tunnel or reverse proxy.
-- `DASHBOARD_SSL_CERT` / `DASHBOARD_SSL_KEY` - paths to your own certificate and key, instead of the generated one.
-
-On first run with `DASHBOARD_SSL=1` the dashboard generates a reusable self-signed certificate under `dashboard_cert/` (gitignored) with the `subjectAltName` entries browsers require. Because the certificate is reused across restarts, trusting it once makes the browser warning stop for good. On Windows:
-
-        Import-Certificate -FilePath "dashboard_cert\dashboard.crt" -CertStoreLocation Cert:\CurrentUser\Root
-
-Then fully restart the browser (Firefox keeps its own trust store, so there you accept the one-time exception in the browser instead). HTTPS is only needed for the one-time **Connect** step; once a token is stored, conflict checks, exports, and contact syncs all work over plain HTTP.
+> Note: with the dashboard's own login removed, the `/pp` setup page is unauthenticated - anyone who can reach the dashboard can set the credentials and the conflict checker login. Keep the dashboard on localhost or a trusted network.
 
 ### Running the conflict check
 

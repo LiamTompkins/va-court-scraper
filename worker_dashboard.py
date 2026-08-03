@@ -10,10 +10,11 @@ import threading
 import webbrowser
 from datetime import datetime, timedelta
 
-from flask import Flask, jsonify, request, Response, redirect, url_for, session
+from flask import Flask, jsonify, request, Response, redirect, url_for
 from sqlalchemy import create_engine, text
 from rapidfuzz import fuzz, process
 from authlib.integrations.requests_client import OAuth2Session
+from werkzeug.security import generate_password_hash
 
 # Seconds without a heartbeat before an active task is considered stale.
 # Matches the threshold used by task_watchdog.py.
@@ -37,18 +38,18 @@ engine = create_engine("postgresql://" + os.environ['POSTGRES_DB'])
 # edited in the dashboard take effect without a restart.
 PP_CLIENT_ID_ENV = os.environ.get('PP_CLIENT_ID', '')
 PP_CLIENT_SECRET_ENV = os.environ.get('PP_CLIENT_SECRET', '')
-PP_AUTHORIZE_URL = 'https://app.practicepanther.com/OAuth/Authorize'
 PP_ACCESS_TOKEN_URL = 'https://app.practicepanther.com/OAuth/Token'
 PP_API_BASE = 'https://app.practicepanther.com/api/v2'
 
-# PracticePanther only accepts HTTPS redirect URLs, so the OAuth handshake needs
-# the dashboard served over TLS. DASHBOARD_SSL=1 runs it with a self-signed
-# ("adhoc") certificate. If PracticePanther still refuses the self-signed
-# localhost URL, put the dashboard behind a tunnel and set
-# DASHBOARD_EXTERNAL_URL to the tunnel's public https:// origin so the redirect
-# URL we send matches the one registered with them.
+# The actual PracticePanther OAuth handshake is done by the separate
+# elh-conflict-checker app; the dashboard's "Connect" button opens its sign-in
+# page. Point this at wherever that app runs.
+CONFLICT_CHECKER_URL = os.environ.get('CONFLICT_CHECKER_URL', 'https://127.0.0.1:5001').rstrip('/')
+
+# DASHBOARD_SSL=1 serves the dashboard over HTTPS with a self-signed ("adhoc")
+# certificate. Optional -- the dashboard no longer does the OAuth handshake
+# itself (the conflict checker does), but HTTPS is still available if wanted.
 DASHBOARD_SSL = os.environ.get('DASHBOARD_SSL', '').lower() in ('1', 'true', 'yes', 'adhoc')
-DASHBOARD_EXTERNAL_URL = os.environ.get('DASHBOARD_EXTERNAL_URL', '').rstrip('/')
 # Point these at your own certificate to avoid the self-signed warning entirely.
 DASHBOARD_SSL_CERT = os.environ.get('DASHBOARD_SSL_CERT', '')
 DASHBOARD_SSL_KEY = os.environ.get('DASHBOARD_SSL_KEY', '')
@@ -57,6 +58,41 @@ DASHBOARD_SSL_KEY = os.environ.get('DASHBOARD_SSL_KEY', '')
 CERT_DIR = 'dashboard_cert'
 CERT_FILE = os.path.join(CERT_DIR, 'dashboard.crt')
 KEY_FILE = os.path.join(CERT_DIR, 'dashboard.key')
+
+
+def save_conflict_checker_login(email, name, password):
+    """Create or update the elh-conflict-checker login in the shared "user"
+    table (the account the user signs in with when Connect opens the conflict
+    checker). "user" is a reserved word in PostgreSQL, so it is quoted. Returns
+    None on success or an error message."""
+    if not email or not password:
+        return 'Email and password are required'
+    pw = generate_password_hash(password, method='pbkdf2:sha256')
+    try:
+        with engine.begin() as conn:
+            existing = conn.execute(text('SELECT id FROM "user" WHERE email = :e'),
+                                    {'e': email}).first()
+            if existing:
+                conn.execute(text('UPDATE "user" SET name = :n, password = :p WHERE email = :e'),
+                             {'n': name, 'p': pw, 'e': email})
+            else:
+                conn.execute(text('INSERT INTO "user" (email, name, password) '
+                                  'VALUES (:e, :n, :p)'),
+                             {'e': email, 'n': name, 'p': pw})
+    except Exception as e:
+        return str(e)
+    return None
+
+
+def conflict_checker_login_status():
+    """(email of the configured conflict-checker account or None, total count)."""
+    try:
+        with engine.connect() as conn:
+            total = conn.execute(text('SELECT COUNT(*) FROM "user"')).scalar() or 0
+            email = conn.execute(text('SELECT email FROM "user" ORDER BY id DESC LIMIT 1')).scalar()
+    except Exception:
+        return None, 0
+    return email, total
 
 
 def ensure_schema():
@@ -89,6 +125,12 @@ def ensure_schema():
         # credentials), so they can be changed without editing the environment.
         'CREATE TABLE IF NOT EXISTS app_settings ('
         ' key VARCHAR(64) PRIMARY KEY, value TEXT, updated_at TIMESTAMP)',
+        # elh-conflict-checker login accounts, shared with that app (matches its
+        # User model). Created from the setup page so the account exists before
+        # the conflict checker has run. "user" is a reserved word, hence quoted.
+        'CREATE TABLE IF NOT EXISTS "user" ('
+        ' id SERIAL PRIMARY KEY, email VARCHAR(100) UNIQUE, password VARCHAR(255),'
+        ' name VARCHAR(1000))',
     ]
     try:
         with engine.begin() as conn:
@@ -1245,26 +1287,16 @@ def pp_credentials():
     return cid, sec, source
 
 
-def pp_redirect_uri():
-    """The OAuth redirect URL, which must match the one registered in
-    PracticePanther character for character. DASHBOARD_EXTERNAL_URL overrides
-    the host we'd otherwise infer, for running behind a tunnel or proxy."""
-    if DASHBOARD_EXTERNAL_URL:
-        return DASHBOARD_EXTERNAL_URL + url_for('pp_authorize')
-    return url_for('pp_authorize', _external=True)
-
-
-def pp_session(with_token=True):
-    """An OAuth2 session built from the currently configured credentials. Built
-    per call so dashboard edits take effect immediately; the stored token is
-    refreshed automatically and written back."""
+def pp_session():
+    """An OAuth2 session built from the configured credentials and the shared
+    token (obtained by the conflict checker). Used to sync contacts; the token
+    is refreshed automatically and written back to the shared table."""
     cid, sec, _ = pp_credentials()
     return OAuth2Session(
         client_id=cid, client_secret=sec,
-        token=pp_get_token() if with_token else None,
+        token=pp_get_token(),
         token_endpoint=PP_ACCESS_TOKEN_URL,
         token_endpoint_auth_method='client_secret_post',
-        redirect_uri=pp_redirect_uri(),
         update_token=lambda token, refresh_token=None, access_token=None: pp_save_token(token),
     )
 
@@ -1371,20 +1403,21 @@ def pp_sync_contacts(full=False):
 
 @app.route('/api/pp/status')
 def pp_status():
-    redirect_uri = pp_redirect_uri()
     cid, sec, source = pp_credentials()
+    login_email, login_count = conflict_checker_login_status()
     data = {
         'configured': bool(cid and sec),
         'client_id_set': bool(cid),
         'client_secret_set': bool(sec),
         # The client id is not a secret, so it is echoed back to prefill the
-        # form. The secret never is -- only whether one is stored.
+        # form. The secret and password never are -- only whether they are set.
         'client_id': cid,
         'client_id_source': source['client_id'],
         'client_secret_source': source['client_secret'],
-        'redirect_uri': redirect_uri,
-        # PracticePanther requires an HTTPS redirect URL when registering an app.
-        'redirect_is_https': redirect_uri.lower().startswith('https://'),
+        'login_email': login_email,
+        'login_configured': login_count > 0,
+        # Where "Connect" sends the user to sign in and do the OAuth handshake.
+        'connect_url': CONFLICT_CHECKER_URL + '/login',
         'contacts': 0, 'last_contact_update': None,
     }
     data.update(pp_token_status())
@@ -1405,15 +1438,33 @@ def pp_save_settings():
     body = request.get_json(force=True, silent=True) or {}
     client_id = (body.get('client_id') or '').strip()
     client_secret = (body.get('client_secret') or '').strip()
+    login_email = (body.get('login_email') or '').strip()
+    login_password = body.get('login_password') or ''
     try:
         set_setting('pp_client_id', client_id)
         if client_secret:
             set_setting('pp_client_secret', client_secret)
     except Exception as e:
         return jsonify({'ok': False, 'error': str(e)}), 500
+    # Only touch the conflict-checker login when an email is given. A blank
+    # password is allowed only if the account already exists (editing the id
+    # without resetting the password).
+    if login_email:
+        if login_password:
+            err = save_conflict_checker_login(login_email, login_email, login_password)
+            if err:
+                return jsonify({'ok': False, 'error': err}), 400
+        else:
+            with engine.connect() as conn:
+                found = conn.execute(text('SELECT 1 FROM "user" WHERE email = :e'),
+                                     {'e': login_email}).first()
+            if not found:
+                return jsonify({'ok': False,
+                                'error': 'Enter a password to create this login.'}), 400
     cid, sec, _ = pp_credentials()
     return jsonify({'ok': True, 'configured': bool(cid and sec),
-                    'secret_updated': bool(client_secret)})
+                    'secret_updated': bool(client_secret),
+                    'login_updated': bool(login_email and login_password)})
 
 
 @app.route('/api/pp/settings/clear', methods=['POST'])
@@ -1428,54 +1479,11 @@ def pp_clear_settings():
     return jsonify({'ok': True})
 
 
-@app.route('/pp/login')
-def pp_login():
-    cid, sec, _ = pp_credentials()
-    if not (cid and sec):
-        return Response('Set the PracticePanther client ID and secret before connecting.',
-                        status=400, mimetype='text/plain')
-    uri, state = pp_session(with_token=False).create_authorization_url(PP_AUTHORIZE_URL)
-    session['pp_oauth_state'] = state
-    return redirect(uri)
-
-
-@app.route('/pp/authorize')
-def pp_authorize():
-    """OAuth callback: exchange the code for a token and store it."""
-    expected = session.pop('pp_oauth_state', None)
-    if not expected or request.args.get('state') != expected:
-        return Response('PracticePanther authorization failed: state mismatch. '
-                        'Start the connection again from the setup page.',
-                        status=400, mimetype='text/plain')
-    code = request.args.get('code')
-    if not code:
-        return Response('PracticePanther authorization failed: no code returned (%s).'
-                        % (request.args.get('error') or 'denied'),
-                        status=400, mimetype='text/plain')
-    try:
-        token = pp_session(with_token=False).fetch_token(
-            PP_ACCESS_TOKEN_URL, code=code, grant_type='authorization_code')
-        pp_save_token(token)
-    except Exception as e:
-        return Response('PracticePanther authorization failed: %s' % e,
-                        status=400, mimetype='text/plain')
-    return redirect(url_for('pp_page'))
-
-
-@app.route('/api/pp/disconnect', methods=['POST'])
-def pp_disconnect():
-    try:
-        with engine.begin() as conn:
-            conn.execute(text('DELETE FROM pp_tokens'))
-    except Exception as e:
-        return jsonify({'ok': False, 'error': str(e)}), 500
-    return jsonify({'ok': True})
-
-
 @app.route('/api/pp/sync', methods=['POST'])
 def pp_sync():
     if not pp_get_token():
-        return jsonify({'ok': False, 'error': 'Not connected to PracticePanther yet.'}), 400
+        return jsonify({'ok': False,
+                        'error': 'Not connected yet -- connect in the conflict checker first.'}), 400
     full = request.args.get('full') in ('1', 'true', 'yes')
     try:
         written = pp_sync_contacts(full=full)
@@ -2318,42 +2326,44 @@ PP_PAGE = """<!DOCTYPE html>
   <div class="meta" id="meta">Loading&hellip;</div>
 
   <div class="step">
-    <h2><span class="num">1</span>API credentials</h2>
+    <h2><span class="num">1</span>Setup</h2>
     <div class="row" id="cred-row"></div>
     <div class="row">
-      <label class="fld">Client ID
+      <label class="fld">PracticePanther Client ID
         <input type="text" id="client-id" placeholder="from PracticePanther" autocomplete="off" spellcheck="false">
       </label>
-      <label class="fld">Client secret
+      <label class="fld">PracticePanther Client secret
         <input type="password" id="client-secret" placeholder="paste the client secret" autocomplete="new-password" spellcheck="false">
       </label>
     </div>
     <div class="row">
-      <button onclick="saveSettings()">Save credentials</button>
-      <button class="secondary" onclick="clearSettings()">Clear saved</button>
+      <label class="fld">Login email
+        <input type="email" id="login-email" placeholder="conflict checker sign-in email" autocomplete="off" spellcheck="false">
+      </label>
+      <label class="fld">Login password
+        <input type="password" id="login-password" placeholder="conflict checker sign-in password" autocomplete="new-password" spellcheck="false">
+      </label>
+    </div>
+    <div class="row">
+      <button onclick="saveSettings()">Save</button>
+      <button class="secondary" onclick="clearSettings()">Clear PP credentials</button>
       <span class="msg" id="cred-msg"></span>
     </div>
-    <div class="muted">Saved in the shared database, so they survive restarts and take effect immediately.
-      The <code>PP_CLIENT_ID</code> / <code>PP_CLIENT_SECRET</code> environment variables are used as a
-      fallback when nothing is saved here.</div>
-    <div class="row" style="margin-top:12px;"><span class="muted">Redirect URL to register in PracticePanther:</span></div>
-    <div class="row"><code id="redirect-uri">&hellip;</code></div>
-    <div id="https-warn"></div>
-    <ol>
-      <li>In PracticePanther, click <b>Support &rarr; Ask us Anything</b> and request API access (granted case by case).</li>
-      <li>Once approved, go to <b>Integrations &rarr; API &rarr; New App</b>.</li>
-      <li>Paste the redirect URL above into the app, then copy its Client ID and Secret into the two environment variables.</li>
-    </ol>
+    <div class="muted">All four values are stored in the shared database. The client id/secret and this login
+      account are used by the elh-conflict-checker to connect to PracticePanther. The
+      <code>PP_CLIENT_ID</code> / <code>PP_CLIENT_SECRET</code> environment variables are a fallback for the
+      credentials when nothing is saved here.</div>
   </div>
 
   <div class="step">
-    <h2><span class="num">2</span>Connection</h2>
+    <h2><span class="num">2</span>Connect</h2>
     <div class="row" id="conn-row"></div>
     <div class="row">
-      <a class="btn" id="connect-btn" href="/pp/login">Connect to PracticePanther</a>
-      <button class="secondary" id="disconnect-btn" onclick="disconnect()">Disconnect</button>
+      <a class="btn" id="connect-btn" href="#" target="_blank" rel="noopener">Connect</a>
     </div>
-    <div class="muted">Authorizing sends you to PracticePanther and back. The token is stored in the shared database and refreshed automatically.</div>
+    <div class="muted">Opens the elh-conflict-checker's sign-in page. Sign in with the login above, then
+      connect to PracticePanther there. The token is stored in the shared database, so this dashboard can
+      use the synced contacts.</div>
   </div>
 
   <div class="step">
@@ -2364,7 +2374,8 @@ PP_PAGE = """<!DOCTYPE html>
       <button class="secondary" id="full-btn" onclick="sync(true)">Full resync</button>
       <span class="msg" id="sync-msg"></span>
     </div>
-    <div class="muted">Contacts land in the shared <code>pp_contact</code> table &mdash; the same list the batch conflict check matches against.</div>
+    <div class="muted">Contacts land in the shared <code>pp_contact</code> table &mdash; the list the batch
+      conflict check matches against. Syncing uses the token obtained in the conflict checker.</div>
   </div>
 
 <script>
@@ -2378,17 +2389,20 @@ function saveSettings() {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       client_id: document.getElementById('client-id').value,
-      client_secret: document.getElementById('client-secret').value
+      client_secret: document.getElementById('client-secret').value,
+      login_email: document.getElementById('login-email').value,
+      login_password: document.getElementById('login-password').value
     })
   }).then(function(r){ return r.json(); }).then(function(d){
     if (!d.ok) { msg.textContent = 'Error: ' + d.error; return; }
     document.getElementById('client-secret').value = '';
-    msg.textContent = d.configured ? 'Saved.' : 'Saved — still missing a value.';
+    document.getElementById('login-password').value = '';
+    msg.textContent = 'Saved.';
     load();
   }).catch(function(e){ msg.textContent = 'Error: ' + e; });
 }
 function clearSettings() {
-  if (!confirm('Forget the credentials saved in the dashboard?')) return;
+  if (!confirm('Forget the PracticePanther credentials saved in the dashboard?')) return;
   fetch('/api/pp/settings/clear', { method: 'POST' }).then(function(){
     document.getElementById('client-secret').value = '';
     document.getElementById('cred-msg').textContent = 'Cleared.';
@@ -2402,30 +2416,26 @@ function load() {
       pill(d.client_id_set ? 'ok' : 'bad', d.client_id_set ? 'Client ID set' : 'Client ID missing') +
       src(d.client_id_source) + ' ' +
       pill(d.client_secret_set ? 'ok' : 'bad', d.client_secret_set ? 'Client secret set' : 'Client secret missing') +
-      src(d.client_secret_source);
+      src(d.client_secret_source) + ' ' +
+      pill(d.login_configured ? 'ok' : 'bad', d.login_configured ? 'Login set' : 'Login not set');
     // Don't clobber what the user is typing.
     var ci = document.getElementById('client-id');
     if (document.activeElement !== ci) ci.value = d.client_id || '';
+    var le = document.getElementById('login-email');
+    if (document.activeElement !== le && d.login_email) le.value = d.login_email;
     document.getElementById('client-secret').placeholder =
       d.client_secret_set ? 'leave blank to keep current' : 'paste the client secret';
-    document.getElementById('redirect-uri').textContent = d.redirect_uri;
-    document.getElementById('https-warn').innerHTML = d.redirect_is_https ? '' :
-      '<div class="row">' + pill('warn', 'HTTP') +
-      '<span class="muted">PracticePanther only accepts HTTPS redirect URLs, and rejects the ' +
-      'authorize request (400) when this does not match the URL registered on their app. ' +
-      'Restart the dashboard with <code>DASHBOARD_SSL=1</code> to serve HTTPS, or put it behind a ' +
-      'tunnel and set <code>DASHBOARD_EXTERNAL_URL</code> to the tunnel\\'s https origin.</span></div>';
+    document.getElementById('login-password').placeholder =
+      d.login_configured ? 'leave blank to keep current' : 'conflict checker sign-in password';
 
     var conn = document.getElementById('conn-row');
-    if (!d.connected) conn.innerHTML = pill('bad', 'Not connected');
+    if (!d.connected) conn.innerHTML = pill('bad', 'Not connected') +
+      '<span class="muted">Connect in the conflict checker.</span>';
     else if (d.expired) conn.innerHTML = pill('warn', 'Token expired') +
-      '<span class="muted">Syncing will refresh it automatically, or reconnect.</span>';
+      '<span class="muted">Syncing will refresh it automatically.</span>';
     else conn.innerHTML = pill('ok', 'Connected') + '<span class="muted">Expires ' +
       (d.expires_at ? new Date(d.expires_at * 1000).toLocaleString() : 'unknown') + '</span>';
-    var cbtn = document.getElementById('connect-btn');
-    cbtn.textContent = d.connected ? 'Reconnect' : 'Connect to PracticePanther';
-    cbtn.style.opacity = d.configured ? 1 : .5;
-    document.getElementById('disconnect-btn').disabled = !d.connected;
+    document.getElementById('connect-btn').href = d.connect_url || '#';
 
     document.getElementById('sync-row').innerHTML =
       pill(d.contacts ? 'ok' : 'warn', d.contacts + ' contacts cached') +
@@ -2446,10 +2456,6 @@ function sync(full) {
         : ('Error: ' + d.error);
       load();
     }).catch(function(e){ msg.textContent = 'Error: ' + e; a.disabled = false; b.disabled = false; });
-}
-function disconnect() {
-  if (!confirm('Remove the stored PracticePanther token?')) return;
-  fetch('/api/pp/disconnect', { method: 'POST' }).then(function(){ load(); });
 }
 load();
 setInterval(load, 15000);

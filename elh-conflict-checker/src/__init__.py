@@ -13,6 +13,23 @@ load_dotenv(os.path.join(project_folder, '.env'))
 db = SQLAlchemy()
 oauth = OAuth()
 
+
+def _shared_setting(db_uri, key):
+    """Read a value from the shared app_settings table, which the worker
+    dashboard's PracticePanther setup page writes to. Returns None if the table
+    or value isn't available, so the environment fallback can take over."""
+    try:
+        from sqlalchemy import create_engine, text
+        engine = create_engine(db_uri)
+        with engine.connect() as conn:
+            value = conn.execute(
+                text('SELECT value FROM app_settings WHERE key = :k'), {'k': key}).scalar()
+        engine.dispose()
+        return value or None
+    except Exception:
+        return None
+
+
 def create_app():
     app = Flask(__name__)
 
@@ -20,9 +37,12 @@ def create_app():
     # Accepts any SQLAlchemy URL, e.g.
     #   postgresql+psycopg://user:pass@host:5432/dbname
     # DATABASE_URL is preferred; MYSQL_DB is still read for backward compatibility.
-    app.config['SQLALCHEMY_DATABASE_URI'] = os.environ.get('DATABASE_URL') or os.environ['MYSQL_DB']
-    app.config['PP_CLIENT_ID'] = os.environ['PP_CLIENT_ID']
-    app.config['PP_CLIENT_SECRET'] = os.environ['PP_CLIENT_SECRET']
+    db_uri = os.environ.get('DATABASE_URL') or os.environ['MYSQL_DB']
+    app.config['SQLALCHEMY_DATABASE_URI'] = db_uri
+    # PracticePanther credentials: prefer the values saved from the worker
+    # dashboard's setup page (shared app_settings table), then the environment.
+    app.config['PP_CLIENT_ID'] = _shared_setting(db_uri, 'pp_client_id') or os.environ.get('PP_CLIENT_ID', '')
+    app.config['PP_CLIENT_SECRET'] = _shared_setting(db_uri, 'pp_client_secret') or os.environ.get('PP_CLIENT_SECRET', '')
     app.config['PP_AUTHORIZE_URL'] = 'https://app.practicepanther.com/OAuth/Authorize'
     app.config['PP_ACCESS_TOKEN_URL'] = 'https://app.practicepanther.com/OAuth/Token'
 
