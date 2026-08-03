@@ -49,6 +49,14 @@ PP_API_BASE = 'https://app.practicepanther.com/api/v2'
 # URL we send matches the one registered with them.
 DASHBOARD_SSL = os.environ.get('DASHBOARD_SSL', '').lower() in ('1', 'true', 'yes', 'adhoc')
 DASHBOARD_EXTERNAL_URL = os.environ.get('DASHBOARD_EXTERNAL_URL', '').rstrip('/')
+# Point these at your own certificate to avoid the self-signed warning entirely.
+DASHBOARD_SSL_CERT = os.environ.get('DASHBOARD_SSL_CERT', '')
+DASHBOARD_SSL_KEY = os.environ.get('DASHBOARD_SSL_KEY', '')
+# Where the generated certificate is kept (gitignored). Reused across restarts so
+# a browser exception -- or trusting it once -- keeps working.
+CERT_DIR = 'dashboard_cert'
+CERT_FILE = os.path.join(CERT_DIR, 'dashboard.crt')
+KEY_FILE = os.path.join(CERT_DIR, 'dashboard.key')
 
 
 def ensure_schema():
@@ -2450,6 +2458,69 @@ setInterval(load, 15000);
 </html>"""
 
 
+def generate_self_signed_cert(cert_path, key_path):
+    """Write a self-signed certificate for localhost/127.0.0.1.
+
+    Flask's built-in 'adhoc' certificate is regenerated on every run, so the
+    browser warns every time and the exception never sticks. This one is written
+    to disk and reused, and carries the subjectAltName entries browsers require
+    (a certificate with only a common name is rejected outright)."""
+    import ipaddress
+    from cryptography import x509
+    from cryptography.x509.oid import NameOID
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([
+        x509.NameAttribute(NameOID.COMMON_NAME, u'localhost'),
+        x509.NameAttribute(NameOID.ORGANIZATION_NAME, u'VA Court Scraper Dashboard'),
+    ])
+    now = datetime.now(tz=None)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(days=1))
+        .not_valid_after(now + timedelta(days=730))
+        .add_extension(x509.SubjectAlternativeName([
+            x509.DNSName(u'localhost'),
+            x509.IPAddress(ipaddress.IPv4Address(u'127.0.0.1')),
+        ]), critical=False)
+        # Marked as a CA so it can be imported into the trusted-root store.
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    if not os.path.isdir(os.path.dirname(cert_path) or '.'):
+        os.makedirs(os.path.dirname(cert_path))
+    with open(key_path, 'wb') as f:
+        f.write(key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=serialization.NoEncryption()))
+    with open(cert_path, 'wb') as f:
+        f.write(cert.public_bytes(serialization.Encoding.PEM))
+
+
+def dashboard_ssl_context():
+    """(cert, key) for serving HTTPS, generating a reusable pair on first run.
+    Falls back to Flask's throwaway 'adhoc' certificate if generation fails."""
+    if DASHBOARD_SSL_CERT and DASHBOARD_SSL_KEY:
+        return (DASHBOARD_SSL_CERT, DASHBOARD_SSL_KEY)
+    try:
+        if not (os.path.isfile(CERT_FILE) and os.path.isfile(KEY_FILE)):
+            generate_self_signed_cert(CERT_FILE, KEY_FILE)
+            print('Generated a self-signed certificate at %s' % CERT_FILE)
+            print('Trust it once to stop the browser warning (see README), or click '
+                  'through the warning each time.')
+        return (CERT_FILE, KEY_FILE)
+    except Exception as e:
+        print('Could not generate a certificate (%s); falling back to adhoc.' % e)
+        return 'adhoc'
+
+
 def open_browser():
     webbrowser.open('%s://127.0.0.1:%d/' % ('https' if DASHBOARD_SSL else 'http', PORT))
 
@@ -2458,8 +2529,5 @@ if __name__ == '__main__':
     # Open the browser shortly after the server starts. The reloader would
     # otherwise trigger this twice, so it is disabled.
     threading.Timer(1.0, open_browser).start()
-    if DASHBOARD_SSL:
-        print('Serving over HTTPS with a self-signed certificate '
-              '(your browser will warn once; proceed past it).')
     app.run(host='127.0.0.1', port=PORT, debug=False, use_reloader=False,
-            ssl_context='adhoc' if DASHBOARD_SSL else None)
+            ssl_context=dashboard_ssl_context() if DASHBOARD_SSL else None)

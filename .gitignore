@@ -81,3 +81,8 @@ chromedriver.exe
 
 worker_logs/
 worker_supervisor.lock
+
+# Locally generated HTTPS certificate for the dashboard (never commit the key)
+dashboard_cert/
+*.key
+*.crt

@@ -97,6 +97,46 @@ The supervisor also reclaims stale tasks each cycle (the same job as the watchdo
 
 The **Worker logs** button at the top opens a viewer for those `worker_logs/` files: pick a log on the left to see its tail on the right, refreshed live while open. Note that the dashboard reads the log directory on its own machine, so it shows logs for collectors running on that same host (in a multi-server setup, logs on other machines aren't visible here).
 
+## PracticePanther conflict checking
+
+The dashboard can check a batch of collected cases for conflicts of interest against VPLC's client list in [PracticePanther](https://www.practicepanther.com/), and the whole PracticePanther setup can be done from the dashboard itself. This shares a database with, and reuses the contact list synced by, the [elh-conflict-checker](elh-conflict-checker/) app (a copy of which is vendored in this repo).
+
+This needs `Authlib`, which is listed in `requirements.txt`.
+
+### Setup (the PracticePanther page)
+
+Open the **PracticePanther** link in the dashboard's top nav (or go to `/pp`). The page walks through three steps:
+
+1. **API credentials.** PracticePanther grants API access case by case - in PracticePanther, click **Support -> Ask us Anything** and request it, then once approved go to **Integrations -> API -> New App**. Enter the **Client ID** and **Client secret** into the form on the page (they are saved in the database and take effect immediately, no restart needed) and register the **redirect URL** the page displays. The `PP_CLIENT_ID` / `PP_CLIENT_SECRET` environment variables are used as a fallback when nothing is saved on the page.
+2. **Connection.** Click **Connect** to authorize with PracticePanther. The token is stored in the shared database and refreshed automatically.
+3. **Client contacts.** Sync PracticePanther accounts into the shared `pp_contact` table - the list the conflict check matches against. Use **Sync new/updated** for a quick incremental pull or **Full resync** to rebuild the cache.
+
+**PracticePanther only accepts HTTPS redirect URLs** and rejects the authorize request with a `400 Bad Request` when the redirect it receives does not match the one registered on your app. So the dashboard must be served over HTTPS for the connection step, and the port in the redirect URL must match. Start it like this (PowerShell):
+
+        $env:DASHBOARD_SSL="1"; python worker_dashboard.py
+
+Relevant environment variables:
+
+- `DASHBOARD_SSL=1` - serve the dashboard over HTTPS.
+- `DASHBOARD_PORT=<port>` - change the port (defaults to 5000); the redirect URL includes it, so it must match what is registered in PracticePanther.
+- `DASHBOARD_EXTERNAL_URL=https://...` - use this exact origin in the redirect URL instead of the inferred host, for running behind a tunnel or reverse proxy.
+- `DASHBOARD_SSL_CERT` / `DASHBOARD_SSL_KEY` - paths to your own certificate and key, instead of the generated one.
+
+On first run with `DASHBOARD_SSL=1` the dashboard generates a reusable self-signed certificate under `dashboard_cert/` (gitignored) with the `subjectAltName` entries browsers require. Because the certificate is reused across restarts, trusting it once makes the browser warning stop for good. On Windows:
+
+        Import-Certificate -FilePath "dashboard_cert\dashboard.crt" -CertStoreLocation Cert:\CurrentUser\Root
+
+Then fully restart the browser (Firefox keeps its own trust store, so there you accept the one-time exception in the browser instead). HTTPS is only needed for the one-time **Connect** step; once a token is stored, conflict checks, exports, and contact syncs all work over plain HTTP.
+
+### Running the conflict check
+
+On the **Collected data** page (`/data`), expand a batch and use:
+
+- **Check client conflicts** - a fuzzy scan (order-insensitive, so court "LAST, FIRST" matches PracticePanther "First Last") that flags exact and near matches for review.
+- **Quick check** - an exact-match-only check, run as a single database join for speed.
+
+Matches list the case, the matched party and its role, and the VPLC client (with an "adverse" tag where relevant). Results can be downloaded as Excel or CSV - each row includes the full collected-data record for the case - and they persist if you leave the page and come back.
+
 ## How to generate person ids
 
 Many effective uses of this data require grouping criminal cases to defendant. Unfortunately, the state does not provide any unique identifier, so the [generate_person_ids.py](https://github.com/bschoenfeld/va-court-scraper/blob/master/generate_person_ids.py) script attempts to create one. The script takes all cases and breaks them into groups based on gender, day of birth (there are no years in the case data), and first letter of last name. For each group, every name is compared to every other name using a fuzzy string match. This process can take a while. The script is built so that it can be run in parallel, one execution for each month of the year. I recommend a beefy server - I use a t2.xlarge on AWS, which has 4 CPUs and 16 GB of memory.
