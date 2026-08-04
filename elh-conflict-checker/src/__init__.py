@@ -88,4 +88,9 @@ def create_app():
     from .main import main as main_blueprint
     app.register_blueprint(main_blueprint)
 
+    # Create any missing tables on startup so the app self-initializes against
+    # the shared database, instead of failing when create_db.py hasn't been run.
+    with app.app_context():
+        db.create_all()
+
     return app
