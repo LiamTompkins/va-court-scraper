@@ -19,6 +19,11 @@ Configuration (environment variables, all optional except POSTGRES_DB):
                           (default: ../../elh-conflict-checker)
     CONFLICT_CHECKER_PYTHON / DASHBOARD_PYTHON
                           override the interpreter used for each app
+    TASK_MANAGER          which stale-task manager to run alongside:
+                          'supervisor' (default; also spawns collectors to match
+                          the desired worker count), 'watchdog' (reclaim only),
+                          or 'none'. Never run both -- they would both reclaim
+                          stale tasks and create duplicate pending rows.
 """
 from __future__ import absolute_import
 from __future__ import print_function
@@ -59,11 +64,16 @@ def resolve_config():
         'cc_dir': cc_dir,
         'dash_py': dash_py,
         'cc_py': cc_py,
+        'task_manager': (os.environ.get('TASK_MANAGER') or 'supervisor').lower(),
         # The conflict checker wants a full SQLAlchemy URL; the dashboard wants
         # the bare user:pass@host/db. Derive one from the other.
         'database_url': 'postgresql+psycopg://' + postgres_db if postgres_db else '',
         'secret_key': os.environ.get('SECRET_KEY') or secrets.token_urlsafe(32),
     }
+
+
+# Which script runs for each TASK_MANAGER choice.
+TASK_MANAGER_SCRIPTS = {'supervisor': 'worker_supervisor.py', 'watchdog': 'task_watchdog.py'}
 
 
 def validate(cfg):
@@ -78,6 +88,11 @@ def validate(cfg):
     if not os.path.isfile(cfg['cc_py']):
         problems.append('Conflict checker interpreter not found: %s '
                         '(set CONFLICT_CHECKER_PYTHON).' % cfg['cc_py'])
+    tm = cfg['task_manager']
+    if tm not in ('supervisor', 'watchdog', 'none'):
+        problems.append("TASK_MANAGER must be 'supervisor', 'watchdog', or 'none' (got %r)." % tm)
+    elif tm != 'none' and not os.path.isfile(os.path.join(HERE, TASK_MANAGER_SCRIPTS[tm])):
+        problems.append('%s not found next to launch.py.' % TASK_MANAGER_SCRIPTS[tm])
     return problems
 
 
@@ -106,6 +121,7 @@ def main():
     print('  Dashboard        : %s (port %s)' % (cfg['dash_py'], cfg['dash_port']))
     print('  Conflict checker : %s (port %s)' % (cfg['cc_py'], cfg['cc_port']))
     print('  Conflict dir     : %s' % cfg['cc_dir'])
+    print('  Task manager     : %s' % cfg['task_manager'])
     print('  Shared database  : %s' % ('set' if cfg['postgres_db'] else 'NOT SET'))
     print('')
 
@@ -142,9 +158,17 @@ def main():
         procs.append(start([cfg['dash_py'], 'worker_dashboard.py'],
                            HERE, dash_env, 'dashboard'))
 
-        print('\nBoth running. Dashboard: http://127.0.0.1:%s   '
-              'Conflict checker: %s\nPress Ctrl+C to stop both.\n'
-              % (cfg['dash_port'], cc_url))
+        # The stale-task manager: the supervisor (also spawns collectors to match
+        # the dashboard's desired worker count) or the watchdog (reclaim only).
+        # Runs with the dashboard's env, which carries POSTGRES_DB.
+        tm = cfg['task_manager']
+        if tm in TASK_MANAGER_SCRIPTS:
+            procs.append(start([cfg['dash_py'], TASK_MANAGER_SCRIPTS[tm]],
+                               HERE, dash_env, tm))
+
+        print('\nRunning. Dashboard: http://127.0.0.1:%s   '
+              'Conflict checker: %s   Task manager: %s\nPress Ctrl+C to stop all.\n'
+              % (cfg['dash_port'], cc_url, tm))
 
         # Wait until either exits, then take the other down too.
         while True:

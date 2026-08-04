@@ -81,7 +81,7 @@ The "Schedule tasks" form at the top creates collection tasks without the comman
 
 The "Scheduled tasks" box lists the tasks currently queued (court, FIPS, case type, and date range), paginated newest-first. It updates live, so tasks disappear from the list as collectors claim them.
 
-The dashboard needs Flask, which is already listed in `requirements.txt`.
+The dashboard runs on Python 3 and imports `Flask`, `rapidfuzz`, and `Authlib` at startup, so run it from a Python 3 virtual environment with `pip install -r requirements.txt`. The Excel export of collected data also uses `openpyxl`, which is included there.
 
 ### Start workers from the dashboard
 
@@ -99,22 +99,25 @@ The **Worker logs** button at the top opens a viewer for those `worker_logs/` fi
 
 ## PracticePanther conflict checking
 
-The dashboard can check a batch of collected cases for conflicts of interest against VPLC's client list in [PracticePanther](https://www.practicepanther.com/). The actual PracticePanther connection is handled by the separate [elh-conflict-checker](elh-conflict-checker/) app (a copy is vendored in this repo); the dashboard is a setup hub that shares its database. The dashboard reads the contact list (`pp_contact`) that the conflict checker syncs, and matches batch case parties against it.
+The dashboard can check a batch of collected cases for conflicts of interest against VPLC's client list in [PracticePanther](https://www.practicepanther.com/). The actual PracticePanther connection is handled by the separate [elh-conflict-checker](elh-conflict-checker/) app (a copy is vendored in this repo); the dashboard is a setup hub that shares its database. The dashboard reads the synced client contacts (`pp_contact`) and matches batch case parties against them.
 
-This needs `Authlib`, which is listed in `requirements.txt`.
+The name matching uses `rapidfuzz` and the PracticePanther sync uses `Authlib`, both listed in `requirements.txt`.
 
-### Running both together
+### Running everything together
 
-The dashboard's **Connect** button opens the conflict checker's sign-in page, so both apps need to be running against the same database. `launch.py` starts them together and shuts both down on Ctrl+C:
+The dashboard's **Connect** button opens the conflict checker's sign-in page, and collecting cases needs a task manager, so several processes have to run against the same database. `launch.py` starts them together and shuts them all down on Ctrl+C:
 
         $env:POSTGRES_DB="<user>:<pass>@<host>:5432/<db>"; python launch.py
 
-It runs the dashboard (port 5000) and the conflict checker (port 5001, adhoc HTTPS), passing the shared database to each. `python launch.py --check` prints the resolved configuration without starting anything. Useful environment variables:
+It runs the dashboard (port 5000), the conflict checker (port 5001, adhoc HTTPS), and the worker supervisor - passing the shared database to each. `python launch.py --check` prints the resolved configuration without starting anything. Useful environment variables:
 
 - `POSTGRES_DB` - shared database as `user:pass@host:port/dbname` (required).
 - `SECRET_KEY` - conflict checker session secret (generated if unset).
 - `DASHBOARD_PORT` / `CONFLICT_CHECKER_PORT` - defaults 5000 / 5001.
-- `CONFLICT_CHECKER_DIR` - path to the conflict checker repo (default `../../elh-conflict-checker`); `CONFLICT_CHECKER_PYTHON` / `DASHBOARD_PYTHON` override the interpreters.
+- `CONFLICT_CHECKER_DIR` - path to a conflict checker checkout that has its own venv; the default `../../elh-conflict-checker` points at a sibling clone. The `elh-conflict-checker/` copy vendored in this repo is source only (no venv), so point at it only after creating a venv there. `CONFLICT_CHECKER_PYTHON` / `DASHBOARD_PYTHON` override the interpreters.
+- `TASK_MANAGER` - `supervisor` (default; spawns collectors to match the desired worker count and reclaims stale tasks), `watchdog` (reclaim stale tasks only), or `none`. Only one runs - never both, since they would both reclaim stale tasks and create duplicate pending rows. The supervisor spawns collectors only when you raise the desired worker count on the dashboard, so it is idle otherwise.
+
+If any of the launched processes exits, `launch.py` stops the rest, so a crash doesn't leave orphans.
 
 To run them separately instead, start the conflict checker with `python -m flask run --cert=adhoc --host=127.0.0.1 --port=5001` (from its directory, with `SECRET_KEY` and `DATABASE_URL` set) and the dashboard with `python worker_dashboard.py`; set `CONFLICT_CHECKER_URL` on the dashboard if the checker isn't at `https://127.0.0.1:5001`.
 
